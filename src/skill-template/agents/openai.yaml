@@ -1,0 +1,4 @@
+interface:
+  display_name: "Alpha C2C for __EXECUTOR__"
+  short_description: "ChatGPT plans and reviews; your coding agent builds and tests."
+  default_prompt: "Use $__SKILL_NAME__ to plan, implement, and review this task with ChatGPT."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Alpha C2C for Codex"
+  short_description: "ChatGPT plans and reviews; your coding agent builds and tests."
+  default_prompt: "Use $alpha-c2c-codex to plan, implement, and review this task with ChatGPT."
