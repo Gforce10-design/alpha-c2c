@@ -58,6 +58,9 @@ A timeout retains the request: reconcile the same page/receipt and reuse the ori
 It requires a newly observed posted user body, a changed assistant response associated with that request, task/STATE markers, a completion control, and two stable reads. Turn counts are supplementary evidence because the UI may render a fixed-size recent-turn window. Posting checks read only the posted user-message DOM body when available, preserving inert link text and excluding toolbar/timing labels; they never use composer text as posting proof. If this structure is unavailable, the accessibility body is a conservative fallback and omitted links leave posting unconfirmed. Marker checks decode visible StaticText so bold `STATE:` and separate `DONE` nodes work; save/read the raw response snapshot too, since tables and headings need not be StaticText. Unsupported page language/structure fails closed; inspect the
 same page instead of resending. Capture each new request into a distinct file.
 
+
+A same-page empty `about:blank` (or an empty snapshot at the pinned URL) is a transient observation, not a conversation-change verdict. The helper observes until the original deadline, never sends or navigates to repair it, and keeps POSTING_UNCONFIRMED on timeout. A real page ID, origin, or conversation change still stops immediately. Blank observations reset response stability; completion still requires two subsequent matching full reads. An existing receipt makes submit observe before any composer read. If the posted body differs from the saved request, retain that mismatch and original receipt; inspect the actual body rather than silently trimming characters or resending.
+
 ## Source-preserving validation
 
 After receiving and evaluating the PLAN, save it outside the repository, and save

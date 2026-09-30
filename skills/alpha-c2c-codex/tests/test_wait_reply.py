@@ -127,6 +127,67 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             w.posted({**self.posted, "url": CHAT.replace("abc-name", "def-name")}, page(url=PROJECT), MESSAGE)
 
+    def test_same_page_blank_recovers_and_requires_two_new_stable_reads(self):
+        blank = page('', '', 'about:blank', users=0, count=0, complete=False)
+        seq = iter([self.posted, blank, blank, blank, blank, self.posted, self.posted])
+        clock = Clock()
+        with patch.object(w, 'orca') as browser:
+            result = w.wait_reply(self.baseline, TASK, timeout=200, read=lambda _: next(seq),
+                                  sleep=clock.sleep, clock=clock, message=MESSAGE)
+            browser.assert_not_called()
+        self.assertEqual(result, self.posted)
+        self.assertEqual(clock.now, 120)
+
+    def test_blank_posting_timeout_saves_uncertainty_then_recovers_no_send(self):
+        blank = page('', '', 'about:blank', users=0, count=0, complete=False)
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as td:
+            receipt = Path(td) / 'receipt.json'
+            self.receipt(receipt)
+            with patch.object(w, 'orca') as browser:
+                result = w.confirm_posting(self.baseline, MESSAGE, receipt, timeout=80,
+                                          read=lambda _: blank, sleep=clock.sleep, clock=clock)
+                self.assertEqual(result['status'], 'POSTING_UNCONFIRMED')
+                self.assertIsNone(result['posted'])
+                self.assertEqual(result['url'], CHAT)
+                self.assertEqual(result['lastObservation'], 'TRANSIENT_EMPTY_PAGE')
+                result = w.confirm_posting(self.baseline, MESSAGE, receipt, timeout=0,
+                                          read=lambda _: self.posted)
+                self.assertTrue(result['posted'])
+                browser.assert_not_called()
+
+    def test_blank_does_not_mask_real_page_origin_or_conversation_change(self):
+        blank = page('', '', 'about:blank', users=0, count=0, complete=False)
+        for changed in [{**blank, 'page':'other'}, {**blank, 'url':'https://example.com'},
+                        {**blank, 'url':CHAT.replace('chat1','chat2')},
+                        {**blank, 'text':text('unexpected document')}]:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                w.check_identity(changed, self.baseline)
+
+    def test_blank_wait_timeout_is_pending_not_completed(self):
+        blank = page('', '', '', users=0, count=0, complete=False)
+        clock = Clock()
+        with self.assertRaises(TimeoutError):
+            w.wait_reply(self.baseline, TASK, timeout=80, read=lambda _: blank,
+                         sleep=clock.sleep, clock=clock, message=MESSAGE)
+
+    def test_existing_receipt_submit_never_pre_reads_or_mutates_blank_page(self):
+        with tempfile.TemporaryDirectory() as td:
+            receipt = Path(td)/'receipt.json'
+            self.receipt(receipt)
+            with patch.object(w,'read_page') as read, patch.object(w,'orca') as browser, \
+                 patch.object(w,'confirm_posting',return_value={'posted':None}) as confirm:
+                self.assertIsNone(w.submit(self.baseline,MESSAGE,receipt)['posted'])
+                read.assert_not_called()
+                browser.assert_not_called()
+                confirm.assert_called_once()
+
+    def test_same_url_empty_snapshot_is_transient_but_new_project_composer_is_not(self):
+        blank = {**page('', '', CHAT, users=0, count=0, complete=False), 'emptyDocument':True}
+        with self.assertRaises(w.TransientEmptyPage):
+            w.check_identity(blank,self.baseline)
+        w.check_identity({**blank,'url':PROJECT,'refs':{'box':{'role':'textbox'}}},page(url=PROJECT))
+
     def test_acquired_new_conversation_is_pinned_during_wait(self):
         baseline = page("", "", PROJECT, users=0, count=0)
         seq = iter([self.posted, {**self.posted, "url": CHAT.replace("chat1", "chat2")}])

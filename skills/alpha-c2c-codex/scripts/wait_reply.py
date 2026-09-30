@@ -21,6 +21,10 @@ POSTED_USER_EXPRESSION = """JSON.stringify((()=>{
 })())"""
 
 
+class TransientEmptyPage(RuntimeError):
+    """Same page temporarily has no document; never a posting/reply receipt."""
+
+
 def orca(page, *args):
     run = subprocess.run(['orca', *args, '--page', page, '--json'], capture_output=True, text=True, timeout=45)
     data = json.loads(run.stdout)
@@ -66,6 +70,7 @@ def read_page(page):
     return {'page': page, 'url': result['origin'], 'count': len(matches), 'text': latest,
             'userCount': len(users), 'lastUser': last_user, 'refs': result.get('refs', {}),
             'userBody': user_body, 'userMessageId': user_id,
+            'emptyDocument': snapshot.strip() in ('', '(empty page)'),
             'generating': generating, 'complete': complete}
 
 
@@ -98,6 +103,13 @@ def check_identity(current, baseline):
     if current['page'] != baseline['page']:
         raise ValueError('Page identity changed')
     old, new = urlsplit(baseline['url']), urlsplit(current['url'])
+    empty = (not current.get('text') and not current.get('lastUser')
+             and not current.get('refs') and not current.get('userBody')
+             and not current.get('count') and not current.get('userCount')
+             and not current.get('generating') and not current.get('complete'))
+    if empty and (current['url'] in ('', 'about:blank')
+                  or (current.get('emptyDocument') and current['url'] == baseline['url'])):
+        raise TransientEmptyPage('Same page is temporarily empty; observe without sending or navigating.')
     if (old.scheme, old.netloc) != (new.scheme, new.netloc):
         raise ValueError('Conversation origin changed')
     if '/c/' in old.path and new.path != old.path:
@@ -149,6 +161,8 @@ def wait_reply(baseline, task, timeout=600, interval=20, read=read_page, sleep=t
             if digest is not None and digest == last:
                 return current
             last = digest
+        except TransientEmptyPage:
+            last = None  # A blank observation cannot count toward two stable reads.
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
             last = None
             errors += 1
@@ -191,6 +205,8 @@ def confirm_posting(baseline, message, receipt, timeout=120, interval=20,
                           'page': current['page'], 'url': current['url'], 'nextAction': 'wait_same_baseline'}
                 receipt.write_text(json.dumps(result, ensure_ascii=False) + '\n')
                 return result
+        except TransientEmptyPage:
+            attempt = {**attempt, 'lastObservation': 'TRANSIENT_EMPTY_PAGE'}
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
             errors += 1
             if errors >= 3:
@@ -220,6 +236,8 @@ def owned_draft_matches(draft, message, known_draft):
 
 def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=None, posting_timeout=120):
     page = baseline['page']
+    if receipt.exists():
+        return confirm_posting(baseline, message, receipt, timeout=posting_timeout)
     current = read_page(page)
     if posted(current, baseline, message):
         if receipt.exists():
@@ -292,6 +310,7 @@ def main():
             print(json.dumps(result)); return 0 if result.get('posted') is True else 2
         if args.action == 'capture':
             result = read_page(args.page)
+            check_identity(result, result)
             if result['generating']:
                 raise ValueError('Page is generating; observe existing request before capturing a new baseline.')
         else:
