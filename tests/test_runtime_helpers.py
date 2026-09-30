@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -65,12 +66,21 @@ class EvidenceTests(unittest.TestCase):
             self.assertNotIn('shell', run.call_args.kwargs)
 
 class WaitTests(unittest.TestCase):
+    # 2026-09-30 posting fix: a turn is recognized by the posted user body (counts are
+    # supplementary) and a reply must differ from the baseline reply.
     def page(self, **kw):
-        return dict({'page':'p','url':'https://chatgpt.com/c/one','count':2,'text':'TASK_ID: task\nSTATE: DONE','complete':True,'generating':False,'userCount':2}, **kw)
-    def baseline(self): return self.page(count=1,userCount=1)
+        return dict({'page':'p','url':'https://chatgpt.com/c/one','count':2,'text':'TASK_ID: task\nSTATE: DONE','complete':True,'generating':False,'userCount':2,'lastUser':'- StaticText "TASK_ID: task"'}, **kw)
+    def baseline(self, **kw):
+        return self.page(**{'count':1,'userCount':1,'lastUser':'- StaticText "earlier request"','text':'TASK_ID: task\nSTATE: PLAN', **kw})
+    def observe_with(self, read, now):
+        # confirm_posting binds read/sleep/clock defaults at definition time; inject fakes.
+        original = W.confirm_posting
+        def sleep(s): now[0] += s
+        return patch.object(W, 'confirm_posting', side_effect=lambda b, m, r, timeout=120: original(b, m, r, timeout=timeout, read=read, sleep=sleep, clock=lambda: now[0]))
 
     def test_old_or_streaming_or_other_task_never_complete(self):
-        for p in [self.page(count=1), self.page(generating=True), self.page(complete=False), self.page(text='STATE: DONE other')]:
+        self.assertTrue(W.eligible(self.page(), self.baseline(), 'task'))
+        for p in [self.page(text='TASK_ID: task\nSTATE: PLAN'), self.page(generating=True), self.page(complete=False), self.page(text='STATE: DONE other'), self.page(lastUser='- StaticText "TASK_ID: other"')]:
             self.assertFalse(W.eligible(p,self.baseline(),'task'))
         with self.assertRaises(ValueError): W.eligible(self.page(url='https://chatgpt.com/c/other'),self.baseline(),'task')
 
@@ -86,28 +96,30 @@ class WaitTests(unittest.TestCase):
     def test_timeout_no_send_and_transient_recovery(self):
         now=[0]
         def sleep(s): now[0]+=s
-        with self.assertRaises(TimeoutError):
-            W.wait_reply(self.baseline(),'task',timeout=40,read=lambda p:self.page(count=1),sleep=sleep,clock=lambda:now[0])
+        with self.assertRaisesRegex(TimeoutError, 'Do not resend'):
+            W.wait_reply(self.baseline(),'task',timeout=40,read=lambda p:self.page(generating=True),sleep=sleep,clock=lambda:now[0])
         self.assertEqual(now[0],40)
         with self.assertRaises(RuntimeError):
             W.wait_reply(self.baseline(),'task',read=lambda p:(_ for _ in ()).throw(RuntimeError()),sleep=sleep,clock=lambda:now[0])
 
-    def test_unposted_composer_fails_fast(self):
+    def test_unchanged_page_is_uncertain_not_unposted(self):
+        # Superseded fail-fast "not posted": an unchanged page is not proof of non-posting.
         now=[0]
         def sleep(s): now[0]+=s
-        with self.assertRaisesRegex(ValueError, 'not posted'):
-            W.wait_reply(self.baseline(),'task',read=lambda p:self.page(count=1,userCount=1),sleep=sleep,clock=lambda:now[0])
-        self.assertEqual(now[0],20)
+        with self.assertRaisesRegex(TimeoutError, 'Do not resend or report non-posting'):
+            W.wait_reply(self.baseline(),'task',timeout=60,read=lambda p:self.baseline(),sleep=sleep,clock=lambda:now[0])
+        self.assertEqual(now[0],60)
 
     def test_posted_requires_new_user_turn_and_actual_message(self):
         current=self.page(lastUser='- StaticText "task hello"')
         self.assertTrue(W.posted(current,self.baseline(),'task hello'))
         self.assertFalse(W.posted(current,self.baseline(),'task other'))
-        self.assertFalse(W.posted(self.page(userCount=1,lastUser='- StaticText "task hello"'),self.baseline(),'task hello'))
+        same=self.baseline(lastUser='- StaticText "task hello"')
+        self.assertFalse(W.posted(same,same,'task hello'))
 
     def test_unknown_draft_cannot_be_replaced_even_with_flag(self):
         with tempfile.TemporaryDirectory() as d:
-            before=self.page(count=1,userCount=1,lastUser='',refs={'e1':{'role':'textbox'}})
+            before=self.baseline(refs={'e1':{'role':'textbox'}})
             with patch.object(W,'read_page',return_value=before), patch.object(W,'composer',return_value='. 멈추지 '), patch.object(W,'orca') as api:
                 with self.assertRaisesRegex(ValueError,'Different draft protected'):
                     W.submit(self.baseline(),'TASK_ID: task\nnew request',Path(d)/'receipt',True,'. 멈추지 ')
@@ -118,30 +130,40 @@ class WaitTests(unittest.TestCase):
 
     def test_submit_clicks_send_and_confirms_new_user_turn(self):
         with tempfile.TemporaryDirectory() as d:
-            before=self.page(count=1,userCount=1,lastUser='',refs={'e1':{'role':'textbox'},'e2':{'role':'button','name':'보내기'}})
+            before=self.baseline(refs={'e1':{'role':'textbox'},'e2':{'role':'button','name':'보내기'}})
             after=self.page(lastUser='- StaticText "task hello"')
-            with patch.object(W,'read_page',side_effect=[before,before,after]), patch.object(W,'composer',side_effect=['','task hello']), patch.object(W,'orca') as api:
+            with patch.object(W,'read_page',side_effect=[before,before]), patch.object(W,'composer',side_effect=['','task hello']), patch.object(W,'orca') as api, self.observe_with(lambda p:after,[0]):
                 result=W.submit(self.baseline(),'task hello',Path(d)/'receipt')
-                self.assertTrue(result['posted'])
+                self.assertTrue(result['posted']); self.assertEqual(result['status'],'POSTED')
                 self.assertEqual(api.call_args_list[-1].args,('p','click','--element','@e2'))
                 self.assertEqual(len(api.call_args_list),2)
 
     def test_submit_uncertain_receipt_never_clicks_again(self):
         with tempfile.TemporaryDirectory() as d:
             receipt=Path(d)/'receipt'; receipt.write_text('{}')
-            with patch.object(W,'read_page',return_value=self.page(count=1,userCount=1,lastUser='')), patch.object(W,'orca') as api:
-                with self.assertRaisesRegex(ValueError,'Prior submit'):
+            with patch.object(W,'read_page',return_value=self.baseline()), patch.object(W,'orca') as api:
+                with self.assertRaisesRegex(ValueError,'Receipt belongs to a different page or request'):
                     W.submit(self.baseline(),'task hello',receipt)
                 api.assert_not_called()
+            receipt.write_text(json.dumps({'attempted':True,'status':'ATTEMPTED','page':'p','url':'https://chatgpt.com/c/one','messageSha256':hashlib.sha256(b'task hello').hexdigest()}))
+            now=[0]
+            with patch.object(W,'read_page',return_value=self.baseline()), patch.object(W,'composer') as composer, patch.object(W,'orca') as api, self.observe_with(lambda p:self.baseline(),now):
+                result=W.submit(self.baseline(),'task hello',receipt)
+                self.assertIsNone(result['posted']); self.assertEqual(result['status'],'POSTING_UNCONFIRMED')
+                api.assert_not_called(); composer.assert_not_called()
+            self.assertEqual(now[0],120)
 
     def test_snapshot_extracts_only_latest_assistant_not_user(self):
         snapshot='- heading "내가 한 말:"\n- StaticText "STATE: DONE task"\n- heading "ChatGPT 답변:"\n- StaticText "STATE: PLAN task"\n- button "응답 다시 생성"\n- heading "내가 한 말:"\n- StaticText "STATE: DONE task"'
         response={'ok':True,'result':{'browserPageId':'p','origin':'https://chatgpt.com/c/one','snapshot':snapshot,'refs':{}}}
-        with patch.object(W.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(response),'')):
+        dom={'ok':True,'result':{'origin':'https://chatgpt.com/c/one','result':json.dumps({'body':'STATE: DONE task','id':None})}}
+        run=lambda *responses: patch.object(W.subprocess,'run',side_effect=[subprocess.CompletedProcess([],0,json.dumps(r),'') for r in responses])
+        with run(response,dom):
             self.assertEqual(W.read_page('p')['text'],'')
         response['result']['snapshot']+='\n- heading "ChatGPT 답변:"\n- StaticText "STATE: BLOCKED task"\n- button "응답 다시 생성"'
-        with patch.object(W.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(response),'')):
+        with run(response,dom):
             page=W.read_page('p')
             self.assertEqual(page['count'],2); self.assertNotIn('STATE: DONE',page['text']); self.assertTrue(page['complete'])
+            self.assertEqual(page['userBody'],'STATE: DONE task')
 
 if __name__=='__main__': unittest.main()

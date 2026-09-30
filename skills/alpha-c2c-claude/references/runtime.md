@@ -26,12 +26,23 @@ and `--owned-draft-file <previously-saved-request>`: the current text must match
 that saved request and carry the same TASK_ID. Do not create an ownership file from
 an unknown draft. Tab inactivity, a task-owned page, or a short draft is never
 proof of ownership. Leave unknown drafts untouched; use a new authorized dedicated
-conversation and carry forward the same unfinished task ID. An uncertain click receipt prevents automatic duplicate
-sends; inspect before another attempt. After confirmed posting, wait:
+conversation and carry forward the same unfinished task ID. An uncertain click receipt prevents duplicate sends. The default submit observation window is 120 seconds, sampled every 20 seconds; it does not retry the click. An expired window yields `posted: null`, `status: POSTING_UNCONFIRMED` and exit 2, not proof of non-posting. The receipt retains the request SHA and owned page. Repeating submit with that receipt only reconciles and cannot send again.
+
+Recheck a delayed send without filling, clicking, navigating, or opening another conversation:
+
+```sh
+python3 <skill-dir>/scripts/wait_reply.py reconcile --baseline <outside-repo>/baseline.json --message-file <request.txt> --receipt <outside-repo>/sent.json
+```
+
+Use `--timeout 0` for one observation. If still uncertain, retain the same receipt/page/request and report uncertainty. Before declaring collaboration unavailable or using local fallback, inspect that exact task-owned tab again, including its latest posted user body, current conversation URL and completed assistant reply. Do not infer non-posting from elapsed time, an unchanged message count, or an empty composer. Do not send duplicates with Enter, JavaScript clicks, new requests, or a new conversation to resolve an uncertain send.
+
+A protected unrelated draft is different from an uncertain send. Use an already-authorized dedicated conversation with the same unfinished task ID if appropriate; preserve the draft instead of asking to delete it when that alternative is available. A new Project page can acquire its `/c/` URL asynchronously. The helper accepts the same Project's initial URL transition and pins the acquired conversation during polling; checkpoint the actual URL after confirmation and read back both session and checkpoint URLs.
+
+After confirmed posting, wait:
 
 
 ```sh
-python3 <skill-dir>/scripts/wait_reply.py wait --baseline <outside-repo>/baseline.json --task <task-id> --output <outside-repo>/reply.json
+python3 <skill-dir>/scripts/wait_reply.py wait --baseline <outside-repo>/baseline.json --task <task-id> --message-file <request.txt> --output <outside-repo>/reply.json
 ```
 
 This single process polls every 20 seconds for up to 10 minutes. In headless
@@ -43,9 +54,8 @@ Do not launch competing pollers or replace this with network-idle loops. A shell
 timeout means inspect the process before starting another. The wait subcommand never sends, reloads, changes tabs,
 or decides acceptance. Read the saved response and inspect actual connector tool
 results separately. A returned BLOCKED is a completed response, not task success.
-An unposted-request error requires inspecting the composer and using submit; it is not a generation timeout. A generation timeout retains the request: reuse the same baseline to wait again.
-It requires a new assistant turn, task/STATE markers, a completion control, and
-two stable reads. Unsupported page language/structure fails closed; inspect the
+A timeout retains the request: reconcile the same page/receipt and reuse the original baseline, never recapture a pending request as a new baseline. The waiter does not infer non-posting from unchanged counts. Passing `--message-file` ties the reply to the exact latest posted request.
+It requires a newly observed posted user body, a changed assistant response associated with that request, task/STATE markers, a completion control, and two stable reads. Turn counts are supplementary evidence because the UI may render a fixed-size recent-turn window. Posting checks read only the posted user-message DOM body when available, preserving inert link text and excluding toolbar/timing labels; they never use composer text as posting proof. If this structure is unavailable, the accessibility body is a conservative fallback and omitted links leave posting unconfirmed. Marker checks decode visible StaticText so bold `STATE:` and separate `DONE` nodes work; save/read the raw response snapshot too, since tables and headings need not be StaticText. Unsupported page language/structure fails closed; inspect the
 same page instead of resending. Capture each new request into a distinct file.
 
 ## Source-preserving validation
