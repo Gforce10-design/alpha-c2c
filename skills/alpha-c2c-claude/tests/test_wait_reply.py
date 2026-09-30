@@ -384,5 +384,92 @@ class InputGuardTests(unittest.TestCase):
         self.assertEqual((result["off"], result["afterOff"]), (False, 0))
 
 
+class ConnectorChipTests(unittest.TestCase):
+    """A selected connector is an attachment chip, not a draft or request text."""
+
+    def ready(self):
+        return {**page(), "refs": {"box": {"role": "textbox"}, "send": {"role": "button", "name": "Send"}}}
+
+    def run_node(self, harness, expression):
+        harness = harness.replace("__EXPR__", json.dumps(expression))
+        return json.loads(subprocess.run(["node", "-e", harness], capture_output=True, text=True, check=True).stdout)
+
+    def fake_dom(self, body_text, chip):
+        # Minimal DOM: element whose innerText includes the chip label unless the chip is removed.
+        return """const chip=%s;const removed=[];
+        const mk=(visible)=>({get innerText(){return %s+(visible()&&chip?chip:'')},clientWidth:500,
+          querySelectorAll:()=>chip&&visible()?[{getAttribute:(a)=>a==='app-mention-display-name'?chip:null,innerText:chip,remove:()=>removed.push(1)}]:[],
+          cloneNode:()=>copy});
+        const copy=mk(()=>removed.length===0);const e=mk(()=>true);
+        const document={body:{appendChild:()=>{}},createElement:()=>({style:{},appendChild:()=>{},remove:()=>{}}),
+          querySelectorAll:(s)=>s.includes('textbox')||s.includes('user-message-bubble')?[{querySelector:()=>e,closest:()=>null,value:undefined,...e}]:[]};
+        """ % (json.dumps(chip), json.dumps(body_text))
+
+    def test_composer_and_posted_reads_exclude_chip_and_report_it(self):
+        dom = self.fake_dom("TASK_ID: t\n", "Code with ChatGPT · alpha-c2c")
+        posted = self.run_node(dom + "process.stdout.write(eval(__EXPR__));", w.POSTED_USER_EXPRESSION)
+        self.assertEqual(posted["body"], "TASK_ID: t\n")
+        self.assertEqual(posted["mentions"], ["Code with ChatGPT · alpha-c2c"])
+        plain = self.run_node(self.fake_dom("TASK_ID: t", "") + "process.stdout.write(eval(__EXPR__));", w.POSTED_USER_EXPRESSION)
+        self.assertEqual((plain["body"], plain["mentions"]), ("TASK_ID: t", []))
+
+    def test_chip_alone_is_not_a_protected_draft_and_insert_keeps_it(self):
+        chip = ["Code with ChatGPT · alpha-c2c"]
+        order = []
+        reads = iter([w.ComposerText(" ", chip), w.ComposerText(MESSAGE, chip)])
+        def browser(p, action, *a):
+            order.append(action if action != "eval" else "caret")
+            return {"result": "caret-start"} if action == "eval" else {}
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(w, "read_page", return_value=self.ready()), patch.object(w, "composer", side_effect=lambda _: next(reads)), \
+                 patch.object(w, "guard_input"), patch.object(w, "orca", side_effect=browser), \
+                 patch.object(w, "confirm_posting", return_value={"posted": True}):
+                self.assertTrue(w.submit(page(), MESSAGE, Path(td) / "receipt.json", protect=lambda _: None)["posted"])
+        self.assertEqual(order, ["caret", "inserttext", "click"])  # fill would wipe the chip
+
+    def test_lost_or_changed_chip_is_never_sent(self):
+        chip = ["Code with ChatGPT · alpha-c2c"]
+        for after in ([], ["Other connector"]):
+            reads = iter([w.ComposerText("", chip), w.ComposerText(MESSAGE, after)])
+            with self.subTest(after=after), tempfile.TemporaryDirectory() as td:
+                with patch.object(w, "read_page", return_value=self.ready()), patch.object(w, "composer", side_effect=lambda _: next(reads)), \
+                     patch.object(w, "orca", return_value={"result": "caret-start"}) as browser:
+                    with self.assertRaisesRegex(ValueError, "Connector chip changed"):
+                        w.submit(page(), MESSAGE, Path(td) / "receipt.json")
+                    self.assertNotIn("click", [c.args[1] for c in browser.call_args_list])
+
+    def test_real_text_beside_chip_stays_protected(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(w, "read_page", return_value=page()), patch.object(w, "composer", return_value=w.ComposerText("r", ["Code with ChatGPT · alpha-c2c"])), \
+                 patch.object(w, "orca") as browser:
+                with self.assertRaises(w.ProtectedDraft) as caught:
+                    w.submit(page(), MESSAGE, Path(td) / "receipt.json")
+                self.assertEqual(caught.exception.draft, "r")
+                browser.assert_not_called()
+
+    def test_composer_reader_strips_chip_from_draft_text(self):
+        values = [{"text": " ", "mentions": ["Code with ChatGPT · alpha-c2c"]}]
+        with patch.object(w, "orca", return_value={"result": json.dumps(values)}) as browser:
+            draft = w.composer("owned")
+        self.assertEqual((str(draft), draft.mentions), (" ", ["Code with ChatGPT · alpha-c2c"]))
+        self.assertIn("withoutMentions", browser.call_args.args[3])
+        dom = self.fake_dom("", "Code with ChatGPT · alpha-c2c")
+        read = self.run_node(dom + "process.stdout.write(eval(__EXPR__));", w.COMPOSER_EXPRESSION)
+        self.assertEqual(read, [{"text": "", "mentions": ["Code with ChatGPT · alpha-c2c"]}])
+
+    def test_caret_failure_never_inserts_or_sends(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(w, "read_page", return_value=self.ready()), \
+                 patch.object(w, "composer", return_value=w.ComposerText("", ["Code with ChatGPT · alpha-c2c"])), \
+                 patch.object(w, "orca", return_value={"result": "no-composer"}) as browser:
+                with self.assertRaisesRegex(ValueError, "caret unavailable"):
+                    w.submit(page(), MESSAGE, Path(td) / "receipt.json")
+                self.assertEqual([c.args[1] for c in browser.call_args_list], ["eval"])
+
+    def test_posted_request_with_mention_pill_confirms(self):
+        current = {**page(MESSAGE, "TASK_ID: task-27\nSTATE: PLAN"), "userBody": MESSAGE + "\n", "userMessageId": "new"}
+        self.assertTrue(w.posted(current, {**page(), "userMessageId": "old", "userBody": "old request"}, MESSAGE))
+
+
 if __name__ == "__main__":
     unittest.main()

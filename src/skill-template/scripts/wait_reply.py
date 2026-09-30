@@ -11,14 +11,41 @@ from urllib.parse import urlsplit
 
 ASSISTANT = re.compile(r'^\s*- heading "(?:ChatGPT 답변:|ChatGPT said:|ChatGPT:)"[^\n]*$', re.M)
 USER = re.compile(r'^\s*- heading "(?:내가 한 말:|You said:)"[^\n]*$', re.M)
+# Connector (app) mentions render as chips in the composer and as pills in the posted
+# message; they are attachments, not request text or someone's draft.
+MENTION = '[data-prompt-link-href^="app://"],[app-mention-name]'
+WITHOUT_MENTIONS = """const withoutMentions=e=>{
+  const found=e.querySelectorAll?Array.from(e.querySelectorAll(%s)):[];
+  if(!found.length) return {text:e.innerText,mentions:[]};
+  const names=found.map(m=>m.getAttribute('app-mention-display-name')||m.innerText.trim());
+  const copy=e.cloneNode(true); copy.querySelectorAll(%s).forEach(m=>m.remove());
+  const host=document.createElement('div');
+  host.style.cssText='position:fixed;left:-100000px;top:0;width:'+(e.clientWidth||600)+'px';
+  host.appendChild(copy); document.body.appendChild(host);
+  const text=copy.innerText; host.remove(); return {text,mentions:names};
+};""" % (json.dumps(MENTION), json.dumps(MENTION))
 POSTED_USER_EXPRESSION = """JSON.stringify((()=>{
+  %s
   let nodes=Array.from(document.querySelectorAll('[data-user-message-bubble]'));
   if(!nodes.length) nodes=Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
   const bubble=nodes.at(-1); if(!bubble) return null;
   const e=bubble.querySelector('[data-markdown-text-tone="user-message"],.whitespace-pre-wrap')||bubble;
   const owner=bubble.closest('[data-message-id],[data-turn-id]');
-  return {body:e.innerText,id:owner?(owner.getAttribute('data-message-id')||owner.getAttribute('data-turn-id')):null};
-})())"""
+  const read=withoutMentions(e);
+  return {body:read.text,mentions:read.mentions,id:owner?(owner.getAttribute('data-message-id')||owner.getAttribute('data-turn-id')):null};
+})())""" % WITHOUT_MENTIONS
+COMPOSER_EXPRESSION = """JSON.stringify((()=>{
+  %s
+  return Array.from(document.querySelectorAll('[role=textbox][contenteditable=true],textarea'))
+    .map(e=>e.value===undefined?withoutMentions(e):{text:e.value,mentions:[]});
+})())""" % WITHOUT_MENTIONS
+# Put the caret before any connector chip so inserted text never replaces it.
+CARET_START_EXPRESSION = """(()=>{
+  const e=document.querySelector('[role=textbox][contenteditable=true]');
+  const first=e&&e.querySelector('p'); if(!first) return 'no-composer';
+  e.focus(); const r=document.createRange(); r.setStart(first,0); r.collapse(true);
+  const s=getSelection(); s.removeAllRanges(); s.addRange(r); return 'caret-start';
+})()"""
 
 
 # Real keystrokes aimed at another app can land in an autofocused ChatGPT composer
@@ -41,6 +68,15 @@ GUARD_EXPRESSION = """JSON.stringify((()=>{
 
 class TransientEmptyPage(RuntimeError):
     """Same page temporarily has no document; never a posting/reply receipt."""
+
+
+class ComposerText(str):
+    """Composer text without connector chips; the chip names ride along."""
+
+    def __new__(cls, text, mentions=()):
+        value = super().__new__(cls, text)
+        value.mentions = list(mentions)
+        return value
 
 
 class ProtectedDraft(ValueError):
@@ -287,12 +323,11 @@ def confirm_posting(baseline, message, receipt, timeout=120, interval=20,
 
 
 def composer(page):
-    expression = "JSON.stringify(Array.from(document.querySelectorAll('[role=textbox][contenteditable=true],textarea')).map(e=>e.value===undefined?e.innerText:e.value))"
-    result = orca(page, 'eval', '--expression', expression)
+    result = orca(page, 'eval', '--expression', COMPOSER_EXPRESSION)
     values = json.loads(result['result'])
     if len(values) != 1:
         raise ValueError('Expected one composer on the owned page')
-    return values[0]
+    return ComposerText(values[0]['text'], values[0].get('mentions', []))
 
 
 def owned_draft_matches(draft, message, known_draft):
@@ -326,11 +361,23 @@ def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=No
     boxes = [ref for ref, meta in current['refs'].items() if meta.get('role') == 'textbox']
     if len(boxes) != 1:
         raise ValueError('Expected one accessible composer')
+    chips = list(getattr(draft, 'mentions', []))
+    if chips and normalized(draft):
+        raise ValueError('Replacing a draft next to a connector chip is unsupported; not sent')
     if protect:
         guard_input(page, enabled=False)  # Only after the draft check; readback catches stray keys.
-    orca(page, 'fill', '--element', '@' + boxes[0], '--value', message)
-    if normalized(composer(page)) != normalized(message):
+    if chips:
+        # fill would wipe the chip that attaches the connector; insert before it instead.
+        if orca(page, 'eval', '--expression', CARET_START_EXPRESSION).get('result') != 'caret-start':
+            raise ValueError('Composer caret unavailable; not sent')
+        orca(page, 'inserttext', '--text', message)
+    else:
+        orca(page, 'fill', '--element', '@' + boxes[0], '--value', message)
+    written = composer(page)
+    if normalized(written) != normalized(message):
         raise ValueError('Composer readback differs from message file; not sent')
+    if list(getattr(written, 'mentions', [])) != chips:
+        raise ValueError('Connector chip changed while composing; not sent')
     current = read_page(page)
     check_identity(current, identity)
     if new_user_turn(current, baseline) or current['generating']:

@@ -22,6 +22,13 @@ releases it only after the unknown-draft check, just for fill/click. A nonzero `
 from `draftAtOpen` or `protectedDraft`, and do not clear it. A 1–3 second gap between tab
 creation and the guard remains; the draft check still protects it.
 
+A selected connector appears as a non-editable chip in the composer and as a mention pill in
+the posted message. It is an attachment, not a draft or request text: composer and posted-body
+reads exclude it and report it separately. When a chip is present, `submit` inserts the request
+before it instead of filling (a fill would delete the chip) and refuses to send if the chip is
+lost or changed. Select the connector before `submit`; do not send manually when `submit`
+refuses — report its error instead.
+
 Before sending each PLAN or review request, capture the exact owned page:
 
 ```sh
