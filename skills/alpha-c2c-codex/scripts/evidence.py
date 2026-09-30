@@ -6,17 +6,60 @@ import json
 import os
 import shlex
 import stat
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
-def git(workspace, *args):
-    return subprocess.check_output(['git', '-C', str(workspace), *args])
+# Observation must not rewrite .git/index: `git diff` refreshes its stat cache even with
+# optional locks off. Snapshot git commands read a private copy so the raw index bytes
+# can be compared before/after.
+READ_ONLY_GIT = dict(os.environ, GIT_OPTIONAL_LOCKS='0')
+
+
+def git(workspace, *args, env=READ_ONLY_GIT):
+    return subprocess.check_output(['git', '-C', str(workspace), *args], env=env)
+
+
+def branch(workspace, env=READ_ONLY_GIT):
+    result = subprocess.run(['git', '-C', str(workspace), 'symbolic-ref', '-q', 'HEAD'],
+                            capture_output=True, env=env)
+    if result.returncode == 1:
+        return {'detached': True}
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+    return {'symbolicRef': result.stdout.decode().strip()}
+
+
+def index_path(workspace):
+    return Path(git(workspace, 'rev-parse', '--path-format=absolute', '--git-path', 'index').decode().strip())
+
+
+def index_file(path):
+    if not path.exists():
+        return {'path': str(path), 'exists': False}
+    data = path.read_bytes()
+    return {'path': str(path), 'exists': True, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
 
 
 def snapshot(workspace):
+    real = index_path(workspace)
+    raw = index_file(real)  # Before any command that could touch it.
+    with tempfile.TemporaryDirectory() as private:
+        copy = Path(private) / 'index'
+        if real.exists():
+            shutil.copy2(real, copy)
+        state = observe(workspace, dict(READ_ONLY_GIT, GIT_INDEX_FILE=str(copy)))
+    if index_file(real) != raw:
+        raise RuntimeError('.git/index changed while observing; another process is using this repository')
+    return {**state, 'gitIndexFile': raw}
+
+
+def observe(workspace, env):
+    git_ = lambda *args: git(workspace, *args, env=env)
     files = {}
-    names = git(workspace, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').split(b'\0')
+    names = git_('ls-files', '-z', '--cached', '--others', '--exclude-standard').split(b'\0')
     for raw in sorted(set(names) - {b''}):
         name = os.fsdecode(raw)
         path = workspace / name
@@ -33,11 +76,13 @@ def snapshot(workspace):
         except FileNotFoundError:
             value = {'missing': True}
         files[name] = value
-    return {'head': git(workspace, 'rev-parse', 'HEAD').decode().strip(),
-            'index': git(workspace, 'ls-files', '--stage', '-z').decode(),
-            'status': git(workspace, 'status', '--porcelain=v1', '-z', '--untracked-files=all').decode(),
-            'stagedDiff': git(workspace, 'diff', '--cached', '--binary', '--no-ext-diff').decode(),
-            'unstagedDiff': git(workspace, 'diff', '--binary', '--no-ext-diff').decode(), 'files': files}
+    return {'head': git_('rev-parse', 'HEAD').decode().strip(),
+            'index': git_('ls-files', '--stage', '-z').decode(),
+            'status': git_('status', '--porcelain=v1', '-z', '--untracked-files=all').decode(),
+            'stagedDiff': git_('diff', '--cached', '--binary', '--no-ext-diff').decode(),
+            'unstagedDiff': git_('diff', '--binary', '--no-ext-diff').decode(), 'files': files,
+            'branch': branch(workspace, env),
+            'refs': git_('for-each-ref', '--format=%(refname)%00%(objectname)').decode()}
 
 
 def save(path, data):
@@ -116,7 +161,7 @@ def main():
             record(a.bridge, workspace, a.task, a.iteration, Path(item['output']), shlex.join(item['argv']), item['exitCode'], changed)
         for name in ('before.json', 'after.json', 'comparison.json'):
             record(a.bridge, workspace, a.task, a.iteration, output / name,
-                   f'evidence.py {name} (HEAD, index, status, diffs, source SHA256)', changed, changed)
+                   f'evidence.py {name} (HEAD, branch symbolic ref, refs, index entries, raw .git/index SHA256, status, diffs, source SHA256)', changed, changed)
         ok = not changed and all(item['exitCode'] == 0 for item in results)
         print(json.dumps({'ok': ok, 'output': str(output), 'preserved': not changed, 'commands': results}))
         return 0 if ok else 1

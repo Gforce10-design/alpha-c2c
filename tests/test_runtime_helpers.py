@@ -46,6 +46,51 @@ class EvidenceTests(unittest.TestCase):
             self.assertFalse(comparison['identical'])
             self.assertIn('files', comparison['changedSections'])
 
+    def test_branch_refs_and_raw_index_recorded_and_compared(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self.repo(d)
+            snap = E.snapshot(root)
+            self.assertTrue(snap['branch']['symbolicRef'].startswith('refs/heads/'))
+            self.assertIn(snap['head'], snap['refs'])
+            index = root / '.git' / 'index'
+            self.assertEqual(snap['gitIndexFile']['sha256'], hashlib.sha256(index.read_bytes()).hexdigest())
+            for argv, section in ((['git', 'checkout', '-q', '-b', 'other'], 'branch'),
+                                  (['git', 'branch', 'extra'], 'refs'),
+                                  (['git', 'update-index', '--refresh', '-q'], None)):
+                with self.subTest(argv=argv):
+                    before = index.read_bytes()
+                    _, comparison = E.execute(root, Path(d) / ('ev-' + argv[1]), [argv])
+                    if section:
+                        self.assertIn(section, comparison['changedSections'])
+                    elif index.read_bytes() != before:
+                        self.assertEqual(comparison['changedSections'], ['gitIndexFile'])
+
+    def test_snapshot_never_rewrites_index_and_detached_head_is_explicit(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self.repo(d)
+            subprocess.run(['git', '-C', str(root), 'checkout', '-q', '--', 'source.txt'], check=True)
+            import os, time
+            future = time.time() + 5
+            os.utime(root / 'source.txt', (future, future))  # Stale stat cache invites an index refresh.
+            index = root / '.git' / 'index'
+            before = index.read_bytes()
+            first, second = E.snapshot(root), E.snapshot(root)
+            self.assertEqual(index.read_bytes(), before)
+            self.assertEqual(first, second)
+            subprocess.run(['git', '-C', str(root), 'checkout', '-q', '--detach'], check=True)
+            self.assertEqual(E.snapshot(root)['branch'], {'detached': True})
+
+    def test_index_change_during_observation_is_not_a_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self.repo(d)
+            original = E.observe
+            def racing(workspace, env):
+                subprocess.run(['git', '-C', str(root), 'add', 'source.txt'], check=True)  # another process
+                return original(workspace, env)
+            with patch.object(E, 'observe', side_effect=racing):
+                with self.assertRaisesRegex(RuntimeError, 'index changed while observing'):
+                    E.snapshot(root)
+
     def test_plan_required_wrong_task_or_stage_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             plan = Path(d)/'plan.txt'; plan.write_text('actual plan')

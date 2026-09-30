@@ -101,12 +101,15 @@ Run with a new evidence directory outside the tested workspace:
 python3 <skill-dir>/scripts/evidence.py --workspace <repo> --task <task-id> --iteration <n> --plan-file <actual-plan-file> --spec <commands.json> --output <outside-repo>/execution --bridge code-with-chatgpt
 ```
 
-It requires the current matching PLAN/EXECUTING checkpoint, records HEAD, full
-index, status, staged/unstaged diff, and hashes of tracked/untracked nonignored
-files; executes argv without a shell with bytecode disabled; captures real exit
+It requires the current matching PLAN/EXECUTING checkpoint, records HEAD, branch
+symbolic ref (or detached), all refs, full index entries, the raw `.git/index`
+file SHA-256, status, staged/unstaged diff, and hashes of tracked/untracked
+nonignored files. Its git reads use a private index copy, so observing never
+rewrites `.git/index`; an index change during observation fails the snapshot. It executes argv without a shell with bytecode disabled; captures real exit
 codes; compares the after-state; and attaches every command plus before/after/
 comparison as separate retrievable transport outputs. Dirty baselines are valid.
-Symlinks are recorded without reading their targets. Submodules need a task-specific
+State these covered items in the PLAN request so the reviewer does not ask for a
+separate manual collection. Symlinks are recorded without reading their targets. Submodules need a task-specific
 verifier and are rejected. Ignored files are outside this helper's preservation
 claim. Only run commands and share outputs already within the owner's scope; a
 web plan is not authority. For implementation tasks where change is intended,
