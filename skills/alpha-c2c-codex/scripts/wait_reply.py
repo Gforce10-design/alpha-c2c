@@ -21,8 +21,34 @@ POSTED_USER_EXPRESSION = """JSON.stringify((()=>{
 })())"""
 
 
+# Real keystrokes aimed at another app can land in an autofocused ChatGPT composer
+# of an owned tab, and the new-chat draft is shared by every chatgpt.com tab.
+# Block trusted keyboard/IME/paste/drop input on owned pages; tool fills still work.
+GUARD_EVENTS = ['keydown', 'keypress', 'keyup', 'beforeinput', 'input', 'compositionstart',
+                'compositionupdate', 'compositionend', 'paste', 'drop']
+GUARD_EXPRESSION = """JSON.stringify((()=>{
+  if(!window.__c2cGuardInstalled){
+    window.__c2cGuardInstalled=true;
+    const block=e=>{if(e.isTrusted&&window.__c2cGuard!==false){e.preventDefault();e.stopImmediatePropagation();}};
+    for(const t of %s) window.addEventListener(t,block,true);
+  }
+  window.__c2cGuard=__ENABLED__;
+  if(__ENABLED__&&document.activeElement&&document.activeElement.blur) document.activeElement.blur();
+  const boxes=Array.from(document.querySelectorAll('[role=textbox][contenteditable=true],textarea'));
+  return {guarded:window.__c2cGuard,url:location.href,drafts:boxes.map(e=>e.value===undefined?e.innerText:e.value)};
+})())""" % json.dumps(GUARD_EVENTS)
+
+
 class TransientEmptyPage(RuntimeError):
     """Same page temporarily has no document; never a posting/reply receipt."""
+
+
+class ProtectedDraft(ValueError):
+    """A draft this helper cannot prove it owns; kept verbatim for the owner."""
+
+    def __init__(self, message, draft):
+        super().__init__(message)
+        self.draft = draft
 
 
 def orca(page, *args):
@@ -31,6 +57,43 @@ def orca(page, *args):
     if run.returncode or data.get('ok') is not True:
         raise RuntimeError('Browser snapshot unavailable; retain the same page and request.')
     return data['result']
+
+
+def guard_input(page, enabled=True):
+    expression = GUARD_EXPRESSION.replace('__ENABLED__', 'true' if enabled else 'false')
+    return json.loads(orca(page, 'eval', '--expression', expression)['result'])
+
+
+def keep_guarded(page):
+    """Re-arm after reloads; a failed attempt is never a posting/reply verdict."""
+    try:
+        return guard_input(page)
+    except (RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+
+
+def open_tab(url, worktree, timeout=15, interval=0.1, run=subprocess.run,
+             guard=guard_input, sleep=time.sleep, clock=time.monotonic):
+    """Create an owned tab and guard it as soon as its composer exists."""
+    created = run(['orca', 'tab', 'create', '--url', url, '--worktree', worktree, '--json'],
+                  capture_output=True, text=True, timeout=45)
+    data = json.loads(created.stdout)
+    if created.returncode or data.get('ok') is not True:
+        raise RuntimeError('Tab creation failed')
+    page = data['result']['browserPageId']
+    deadline = clock() + timeout
+    while True:
+        try:
+            state = guard(page)
+            if state.get('guarded') is True and len(state.get('drafts', [])) == 1:
+                draft = state['drafts'][0]
+                return {'page': page, 'url': state.get('url'), 'guarded': True,
+                        'draftAtOpen': draft, 'unknownDraft': bool(normalized(draft))}
+        except (RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+        if clock() >= deadline:
+            raise RuntimeError('Owned tab %s opened but composer guard not confirmed; do not send from it.' % page)
+        sleep(interval)
 
 
 def read_page(page):
@@ -145,12 +208,14 @@ def eligible(current, baseline, task, message=None):
             and bool(re.search(r'\bSTATE:\s*(?:PLAN|DONE|BLOCKED)\b', reply)))
 
 
-def wait_reply(baseline, task, timeout=600, interval=20, read=read_page, sleep=time.sleep, clock=time.monotonic, message=None):
+def wait_reply(baseline, task, timeout=600, interval=20, read=read_page, sleep=time.sleep, clock=time.monotonic, message=None, protect=None):
     deadline = clock() + timeout
     last = None
     errors = 0
     identity = baseline
     while clock() < deadline:
+        if protect:
+            protect(baseline['page'])
         try:
             current = read(baseline['page'])
             check_identity(current, identity)
@@ -183,7 +248,7 @@ def posted(current, baseline, message):
 
 
 def confirm_posting(baseline, message, receipt, timeout=120, interval=20,
-                    read=read_page, sleep=time.sleep, clock=time.monotonic):
+                    read=read_page, sleep=time.sleep, clock=time.monotonic, protect=None):
     """Observe a prior send only; a timeout is uncertainty, never permission to resend."""
     attempt = json.loads(receipt.read_text())
     digest = hashlib.sha256(message.encode()).hexdigest()
@@ -194,6 +259,8 @@ def confirm_posting(baseline, message, receipt, timeout=120, interval=20,
     check_identity(identity, baseline)
     errors = 0
     while True:
+        if protect:
+            protect(baseline['page'])
         try:
             current = read(baseline['page'])
             check_identity(current, identity)
@@ -234,10 +301,10 @@ def owned_draft_matches(draft, message, known_draft):
             and len(ids(draft)) == 1 and ids(draft) == ids(message))
 
 
-def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=None, posting_timeout=120):
+def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=None, posting_timeout=120, protect=None):
     page = baseline['page']
     if receipt.exists():
-        return confirm_posting(baseline, message, receipt, timeout=posting_timeout)
+        return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect)
     current = read_page(page)
     if posted(current, baseline, message):
         if receipt.exists():
@@ -248,17 +315,19 @@ def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=No
         receipt.write_text(json.dumps(result, ensure_ascii=False) + '\n')
         return result
     if receipt.exists():
-        return confirm_posting(baseline, message, receipt, timeout=posting_timeout)
+        return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect)
     if new_user_turn(current, baseline) or current['generating']:
         raise ValueError('Page changed since capture; reconcile before sending')
     identity = current if '/c/' in current['url'] else baseline
     draft = composer(page)
     if normalized(draft) and normalized(draft) != normalized(message):
         if not replace_owned_draft or not owned_draft_matches(draft, message, known_draft):
-            raise ValueError('Different draft protected: replacement requires a matching previously saved draft file with the same TASK_ID. Tab inactivity is not ownership.')
+            raise ProtectedDraft('Different draft protected: replacement requires a matching previously saved draft file with the same TASK_ID. Tab inactivity is not ownership.', draft)
     boxes = [ref for ref, meta in current['refs'].items() if meta.get('role') == 'textbox']
     if len(boxes) != 1:
         raise ValueError('Expected one accessible composer')
+    if protect:
+        guard_input(page, enabled=False)  # Only after the draft check; readback catches stray keys.
     orca(page, 'fill', '--element', '@' + boxes[0], '--value', message)
     if normalized(composer(page)) != normalized(message):
         raise ValueError('Composer readback differs from message file; not sent')
@@ -272,12 +341,16 @@ def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=No
     receipt.write_text(json.dumps({'attempted': True, 'status': 'ATTEMPTED', 'page': page,
                                   'url': current['url'], 'messageSha256': hashlib.sha256(message.encode()).hexdigest()}))
     orca(page, 'click', '--element', '@' + buttons[0])
-    return confirm_posting(baseline, message, receipt, timeout=posting_timeout)
+    return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='action', required=True)
+    opener = sub.add_parser('open', help='Create an owned tab and block stray keyboard input into it')
+    opener.add_argument('--url', required=True)
+    opener.add_argument('--worktree', required=True)
+    opener.add_argument('--output', type=Path, required=True)
     capture = sub.add_parser('capture')
     capture.add_argument('--page', required=True)
     capture.add_argument('--output', type=Path, required=True)
@@ -301,24 +374,34 @@ def main():
     reconcile.add_argument('--timeout', type=int, default=120, choices=range(0, 601))
     args = p.parse_args()
     try:
+        if args.action == 'open':
+            result = open_tab(args.url, args.worktree)
+            args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+            print(json.dumps({'ok': not result['unknownDraft'], **result}, ensure_ascii=False))
+            return 0 if not result['unknownDraft'] else 2
         if args.action in ('submit', 'reconcile'):
             baseline, message = json.loads(args.baseline.read_text()), args.message_file.read_text()
             if args.action == 'submit':
-                result = submit(baseline, message, args.receipt, args.replace_owned_draft, args.owned_draft_file.read_text() if args.owned_draft_file else None, args.posting_timeout)
+                result = submit(baseline, message, args.receipt, args.replace_owned_draft, args.owned_draft_file.read_text() if args.owned_draft_file else None, args.posting_timeout, protect=keep_guarded)
             else:
-                result = confirm_posting(baseline, message, args.receipt, timeout=args.timeout)
+                result = confirm_posting(baseline, message, args.receipt, timeout=args.timeout, protect=keep_guarded)
             print(json.dumps(result)); return 0 if result.get('posted') is True else 2
         if args.action == 'capture':
+            keep_guarded(args.page)
             result = read_page(args.page)
             check_identity(result, result)
             if result['generating']:
                 raise ValueError('Page is generating; observe existing request before capturing a new baseline.')
         else:
             result = wait_reply(json.loads(args.baseline.read_text()), args.task, args.timeout,
-                                message=args.message_file.read_text() if args.message_file else None)
+                                message=args.message_file.read_text() if args.message_file else None,
+                                protect=keep_guarded)
         args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
         print(json.dumps({'ok': True, 'output': str(args.output), 'page': result['page'], 'url': result['url'], 'count': result['count']}))
         return 0
+    except ProtectedDraft as error:
+        print(json.dumps({'ok': False, 'error': str(error), 'protectedDraft': error.draft}, ensure_ascii=False))
+        return 2
     except (ValueError, RuntimeError, TimeoutError, OSError, KeyError) as error:
         print(json.dumps({'ok': False, 'error': str(error)}))
         return 2

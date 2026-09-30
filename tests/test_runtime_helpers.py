@@ -76,7 +76,7 @@ class WaitTests(unittest.TestCase):
         # confirm_posting binds read/sleep/clock defaults at definition time; inject fakes.
         original = W.confirm_posting
         def sleep(s): now[0] += s
-        return patch.object(W, 'confirm_posting', side_effect=lambda b, m, r, timeout=120: original(b, m, r, timeout=timeout, read=read, sleep=sleep, clock=lambda: now[0]))
+        return patch.object(W, 'confirm_posting', side_effect=lambda b, m, r, timeout=120, protect=None: original(b, m, r, timeout=timeout, read=read, sleep=sleep, clock=lambda: now[0], protect=protect))
 
     def test_old_or_streaming_or_other_task_never_complete(self):
         self.assertTrue(W.eligible(self.page(), self.baseline(), 'task'))

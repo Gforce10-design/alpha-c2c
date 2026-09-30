@@ -299,5 +299,90 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(clock.now, 40)
 
 
+class InputGuardTests(unittest.TestCase):
+    """Stray real keystrokes must not become drafts in owned ChatGPT tabs."""
+
+    def created(self, page_id="fresh"):
+        return lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps({"ok": True, "result": {"browserPageId": page_id}}), "")
+
+    def test_open_guards_as_soon_as_composer_exists(self):
+        clock = Clock()
+        states = iter([RuntimeError("loading"), {"guarded": True, "drafts": []}, {"guarded": True, "url": "https://chatgpt.com/", "drafts": [""]}])
+        def guard(page):
+            self.assertEqual(page, "fresh")
+            state = next(states)
+            if isinstance(state, Exception):
+                raise state
+            return state
+        result = w.open_tab("https://chatgpt.com/", "path:/x", run=self.created(), guard=guard, sleep=clock.sleep, clock=clock)
+        self.assertEqual(result, {"page": "fresh", "url": "https://chatgpt.com/", "guarded": True, "draftAtOpen": "", "unknownDraft": False})
+
+    def test_open_reports_preexisting_draft_verbatim_without_clearing(self):
+        result = w.open_tab("u", "w", run=self.created(), guard=lambda _: {"guarded": True, "drafts": ["r"]})
+        self.assertTrue(result["unknownDraft"])
+        self.assertEqual(result["draftAtOpen"], "r")
+
+    def test_open_fails_closed_when_guard_never_confirms(self):
+        clock = Clock()
+        with self.assertRaisesRegex(RuntimeError, "guard not confirmed; do not send"):
+            w.open_tab("u", "w", run=self.created(), guard=lambda _: {"guarded": False, "drafts": [""]}, sleep=clock.sleep, clock=clock, timeout=1)
+
+    def test_wait_and_confirm_rearm_guard_every_observation(self):
+        clock, calls = Clock(), []
+        with self.assertRaises(TimeoutError):
+            w.wait_reply(page(), TASK, timeout=60, read=lambda _: page(), sleep=clock.sleep, clock=clock, protect=calls.append)
+        self.assertEqual(calls, ["owned"] * 3)
+        with tempfile.TemporaryDirectory() as td:
+            receipt = Path(td) / "receipt.json"
+            receipt.write_text(json.dumps(dict(attempted=True, page="owned", messageSha256=hashlib.sha256(MESSAGE.encode()).hexdigest())))
+            calls.clear()
+            clock = Clock()
+            w.confirm_posting(page(), MESSAGE, receipt, timeout=40, read=lambda _: page(), sleep=clock.sleep, clock=clock, protect=calls.append)
+            self.assertEqual(calls, ["owned"] * 3)
+
+    def test_unknown_draft_keeps_guard_on_and_returns_exact_draft(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(w, "read_page", return_value=page()), patch.object(w, "composer", return_value="r"), \
+                 patch.object(w, "guard_input") as guard, patch.object(w, "orca") as browser:
+                with self.assertRaises(w.ProtectedDraft) as caught:
+                    w.submit(page(), MESSAGE, Path(td) / "receipt.json", protect=lambda _: None)
+                self.assertEqual(caught.exception.draft, "r")
+                guard.assert_not_called()
+                browser.assert_not_called()
+
+    def test_guard_released_only_after_draft_check_and_before_fill(self):
+        ready = {**page(), "refs": {"box": {"role": "textbox"}, "send": {"role": "button", "name": "Send"}}}
+        order = []
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(w, "read_page", return_value=ready), \
+                 patch.object(w, "composer", side_effect=lambda _: order.append("composer") or ("" if "fill" not in order else MESSAGE)), \
+                 patch.object(w, "guard_input", side_effect=lambda p, enabled=True: order.append(("guard", enabled))), \
+                 patch.object(w, "orca", side_effect=lambda p, action, *a: order.append(action)), \
+                 patch.object(w, "confirm_posting", return_value={"posted": True}):
+                w.submit(page(), MESSAGE, Path(td) / "receipt.json", protect=lambda _: None)
+        self.assertEqual(order[:4], ["composer", ("guard", False), "fill", "composer"])
+        self.assertEqual(order[-1], "click")
+
+    def test_guard_script_blocks_only_trusted_input_while_enabled(self):
+        harness = """const listeners={};const window={addEventListener:(t,f,c)=>{if(!c)throw 'capture';(listeners[t]=listeners[t]||[]).push(f)}};
+        const blurred=[];const box={innerText:'r',blur:()=>blurred.push(1)};
+        const document={activeElement:box,querySelectorAll:()=>[box]};const location={href:'https://chatgpt.com/'};
+        const fire=(t,trusted)=>{let blocked=0;const e={isTrusted:trusted,preventDefault:()=>blocked++,stopImmediatePropagation:()=>blocked++};(listeners[t]||[]).forEach(f=>f(e));return blocked};
+        const on=JSON.parse(eval(__ON__));const again=JSON.parse(eval(__ON__));
+        const out={on,count:listeners.keydown.length,trusted:fire('keydown',true),ime:fire('compositionstart',true),paste:fire('paste',true),tool:fire('input',false),blurred:blurred.length};
+        const off=JSON.parse(eval(__OFF__));out.off=off.guarded;out.afterOff=fire('keydown',true);
+        process.stdout.write(JSON.stringify(out));"""
+        on = w.GUARD_EXPRESSION.replace("__ENABLED__", "true")
+        off = w.GUARD_EXPRESSION.replace("__ENABLED__", "false")
+        harness = harness.replace("__ON__", json.dumps(on)).replace("__OFF__", json.dumps(off))
+        result = json.loads(subprocess.run(["node", "-e", harness], capture_output=True, text=True, check=True).stdout)
+        self.assertEqual(result["on"], {"guarded": True, "url": "https://chatgpt.com/", "drafts": ["r"]})
+        self.assertEqual(result["count"], 1)  # Idempotent across repeated installs.
+        self.assertEqual((result["trusted"], result["ime"], result["paste"]), (2, 2, 2))
+        self.assertEqual(result["tool"], 0)
+        self.assertEqual(result["blurred"], 2)
+        self.assertEqual((result["off"], result["afterOff"]), (False, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

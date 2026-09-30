@@ -13,6 +13,7 @@ Do not mix APIs from different browser integrations or assume every host has Orc
 If no browser integration exists, explain the limitation and provide the prepared message for manual delivery.
 
 - Preserve every unknown composer draft. An inactive tab is not proof nobody owns its draft. Never clear it merely to continue automation.
+- For Orca ChatGPT tabs, create the owned tab with the helper's `open` subcommand (see runtime reference) so stray keystrokes cannot become drafts.
 - Bind an exact task-owned tab ID and conversation URL. Do not interfere with another session's generating conversation.
 - Verify the account, Project, and conversation on the actual page. Resume the saved conversation when a checkpoint exists.
 - After filling the composer, read it back and verify the task ID and final paragraph. A successful input-tool response is insufficient.

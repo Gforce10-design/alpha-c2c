@@ -6,6 +6,22 @@ assignments or compound commands are needed.
 
 ## Orca reply wait
 
+Open a new task-owned ChatGPT tab through the helper, not raw `orca tab create`:
+
+```sh
+python3 <skill-dir>/scripts/wait_reply.py open --url https://chatgpt.com/ --worktree <browser-worktree> --output <outside-repo>/opened.json
+```
+
+A new ChatGPT tab autofocuses its composer, so the owner's live keystrokes aimed at another
+window can land there; the new-chat draft is shared by every chatgpt.com tab. `open` blocks
+trusted keyboard, IME, paste, and drop input on the owned page as soon as the composer exists
+and records the draft present at that moment. Tool fills still work. `capture`, `wait`,
+`reconcile`, and `submit` re-arm the guard on each observation (reloads drop it); `submit`
+releases it only after the unknown-draft check, just for fill/click. A nonzero `open` exit with
+`unknownDraft: true` means a draft existed before the guard: keep it, report its exact text
+from `draftAtOpen` or `protectedDraft`, and do not clear it. A 1–3 second gap between tab
+creation and the guard remains; the draft check still protects it.
+
 Before sending each PLAN or review request, capture the exact owned page:
 
 ```sh

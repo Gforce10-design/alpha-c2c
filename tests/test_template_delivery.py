@@ -7,3 +7,4 @@ spec = importlib.util.spec_from_file_location(
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 DeliveryTests = module.DeliveryTests
+InputGuardTests = module.InputGuardTests
