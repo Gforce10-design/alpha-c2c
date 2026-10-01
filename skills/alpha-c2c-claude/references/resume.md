@@ -34,3 +34,5 @@ code-with-chatgpt session set -w <path> --task <id> --protocol-state EXECUTED_SE
 ```
 
 Use EXECUTING immediately before execution, EXECUTED_LOCAL after recording real results, and EXECUTED_SENT only after the message is visibly posted.
+
+After saving a new conversation or a completed checkpoint, read `session get` back. The top-level session URL and `checkpoint.chatUrl` must both identify the same task-owned conversation. A mismatch is a persistence defect, not completion evidence; preserve the record and correct it within the task's scope. Never clear an unfinished checkpoint or reset its task ID to evade a retry limit.
