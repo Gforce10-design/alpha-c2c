@@ -1,6 +1,19 @@
 # Deliver messages to the web reviewer
 
 Honor the user's selected browser. Otherwise use an available browser integration that can inspect the page and target a specific tab.
+
+## Choose a delivery mode
+
+| Mode | When | Who clicks | What the helper guarantees |
+| --- | --- | --- | --- |
+| Orca helper | Orca is installed | The helper | Guarded owned tab, AX and DOM cross-check, native insertion, ready-button wait, receipts, paced waits |
+| Agent-driven | Any browser tool that can run page JavaScript and click (Claude in Chrome, Playwright MCP, Codex browser) | The agent, once, on the returned selector | The same request proof, posting, draft, identity and two-stable-read judgments over saved DOM observations |
+| Manual | No browser tool | The user | Prepared request only; posting and replies are unverified until observed |
+
+Agent-driven mode reads only the DOM: the AX/DOM identity cross-check and the keyboard input guard are unavailable, and the agent itself must save each observation faithfully and click only once. The helper still refuses repeated or rushed observations as stability, but its integrity rests on the agent. See the [runtime reference](runtime.md#agent-driven-delivery).
+
+## Orca
+
 For Orca, read its installed `orca-cli` skill and current browser reference:
 
 ```sh

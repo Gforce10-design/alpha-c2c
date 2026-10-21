@@ -4,6 +4,63 @@ These helpers automate mechanical operations, not permission or review decisions
 Use the installed skill directory below. Invoke literal Python commands; no shell
 assignments or compound commands are needed.
 
+## Agent-driven delivery
+
+Use this without Orca, with any browser tool that can run JavaScript in a specific
+ChatGPT tab and click. The helper never touches the browser here; it only judges
+observations the agent saves. Use one tab for the task and a stable page label
+such as `agent:<tab id>` for every command.
+
+1. Print the read-only observation expression once:
+
+   ```sh
+   python3 <skill-dir>/scripts/wait_reply.py observe-expression
+   ```
+
+   Each observation = run that exact expression in the owned tab and save the
+   returned JSON string, unchanged, to a new file. Never edit or reuse a file.
+
+2. Capture the baseline from a fresh observation. Exit code 2 with `unknownDraft`
+   means someone's draft is in the composer: preserve it and stop, as in the Orca flow.
+
+   ```sh
+   python3 <skill-dir>/scripts/wait_reply.py agent-capture --observation <obs-0.json> --page-id agent:<tab> --output <outside-repo>/baseline.json
+   ```
+
+3. Generate the request and proof with `c2c.py message ... --baseline <baseline.json>`.
+   Put exactly that text in the composer with your browser tool (attach the
+   expected connector first if needed). Do not press Enter.
+4. Observe again and run the pre-click check. Only `READY_TO_CLICK` (exit 0)
+   permits one click on the returned `selector`; it writes the ATTEMPTED receipt
+   first. Any other result means do not click; correct the draft and observe again.
+
+   ```sh
+   python3 <skill-dir>/scripts/wait_reply.py agent-check-send --baseline <baseline.json> --message-file <request.txt> --request-proof <request-proof.json> --receipt <outside-repo>/receipt.json --observation <obs-1.json>
+   ```
+
+5. Click that selector once. After that, never click Send or press Enter again
+   for this request, even if posting looks absent.
+6. Confirm posting by passing every observation taken since the click, oldest
+   first. Exit 3 (`PENDING`) means observe again after `nextPollSeconds` and rerun
+   with all of them. A timeout records POSTING_UNCONFIRMED; reconcile, never resend.
+
+   ```sh
+   python3 <skill-dir>/scripts/wait_reply.py agent-confirm --baseline <baseline.json> --message-file <request.txt> --request-proof <request-proof.json> --receipt <receipt.json> --observation <obs-2.json> <obs-3.json>
+   ```
+
+7. Wait for the reply the same way, observing about every 20 seconds. Observations
+   must be in order and at least 10 seconds apart; two identical completed reads
+   are required. Exit 0 saves the reply to `--output`; exit 2 with
+   `reply_mismatch`/`reply_invalid_state` is a refusal as described below.
+
+   ```sh
+   python3 <skill-dir>/scripts/wait_reply.py agent-wait --baseline <baseline.json> --task <id> --message-file <request.txt> --request-proof <request-proof.json> --receipt <receipt.json> --output <outside-repo>/reply.json --observation <obs-4.json> <obs-5.json>
+   ```
+
+Compared with the Orca helper this mode has no AX/DOM cross-check and no keyboard
+input guard, and the helper cannot tell whether a file is a genuine, unedited
+observation. Report it as agent-driven delivery.
+
 ## Orca reply wait
 
 Open a new task-owned ChatGPT tab through the helper, not raw `orca tab create`:
