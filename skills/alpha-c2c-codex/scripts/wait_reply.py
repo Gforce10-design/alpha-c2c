@@ -136,6 +136,25 @@ GUARD_EXPRESSION = """JSON.stringify((()=>{
   return {guarded:window.__c2cGuard,url:location.href,drafts:boxes.map(e=>e.value===undefined?e.innerText:e.value)};
 })())""" % json.dumps(GUARD_EVENTS)
 
+# Agent-driven delivery: the agent runs this read-only expression with its own
+# browser tool and saves the returned JSON string. No AX snapshot exists here, so
+# the AX/DOM identity cross-check of read_page is not available in this mode.
+OBSERVATION_SCHEMA = 'c2c-dom-observation-v1'
+STOP_NAMES = ['중지', 'Stop', 'Stop generating', '생성 중지', 'Stop streaming', '스트리밍 중지']
+OBSERVE_EXPRESSION = """JSON.stringify((()=>{
+  const posted=JSON.parse(%s);
+  const composer=JSON.parse(%s);
+  const sendReady=JSON.parse(%s);
+  const stop=%s;
+  const generating=!!document.querySelector('[data-testid="stop-button"]')||
+    Array.from(document.querySelectorAll('button')).some(b=>stop.includes(b.getAttribute('aria-label')||''));
+  return {schema:%s,url:location.href,observedAt:Date.now(),
+    emptyDocument:!document.body||!document.body.innerText.trim(),generating,posted,composer,sendReady};
+})())""" % (POSTED_TURNS_EXPRESSION, COMPOSER_EXPRESSION, SEND_READY_EXPRESSION,
+            json.dumps(STOP_NAMES, ensure_ascii=False), json.dumps(OBSERVATION_SCHEMA))
+AGENT_PAGE_PREFIX = 'agent:'
+AGENT_MIN_GAP_SECONDS = 10
+
 
 class TransientEmptyPage(RuntimeError):
     """Same page temporarily has no document; never a posting/reply receipt."""
@@ -160,6 +179,8 @@ class ProtectedDraft(ValueError):
 
 
 def orca(page, *args):
+    if page.startswith(AGENT_PAGE_PREFIX):
+        raise ValueError('Agent-driven page; use the agent-* subcommands, never Orca')
     run = subprocess.run(['orca', *args, '--page', page, '--json'], capture_output=True, text=True, timeout=45)
     data = json.loads(run.stdout)
     if run.returncode or data.get('ok') is not True:
@@ -701,6 +722,167 @@ def confirm_posting(baseline, message, receipt, timeout=120, interval=20,
         sleep(min(interval, max(0, deadline - clock())))
 
 
+class ObservationsExhausted(Exception):
+    """Replay consumed every supplied observation; observe again, never resend."""
+
+
+def load_observation(path):
+    """The saved tool result may be the JSON object or its JSON string."""
+    value = json.loads(path.read_text(encoding='utf-8'))
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, dict) or value.get('schema') != OBSERVATION_SCHEMA:
+        raise ValueError('Not a %s observation: %s' % (OBSERVATION_SCHEMA, path))
+    if not isinstance(value.get('url'), str) or type(value.get('observedAt')) not in (int, float):
+        raise ValueError('Observation lacks url/observedAt: %s' % path)
+    return value
+
+
+def page_from_observation(observation, page):
+    """The read_page shape from one DOM observation, without AX snapshot fields."""
+    posted = observation.get('posted') or {}
+    turns = posted.get('turns') or []
+    if not isinstance(turns, list) or not all(
+            isinstance(t, dict) and t.get('role') in ('user', 'assistant') and isinstance(t.get('body'), str)
+            for t in turns):
+        raise ValueError('Observation turns are malformed; observe again without sending')
+    users = [t for t in turns if t['role'] == 'user']
+    assistants = [t for t in turns if t['role'] == 'assistant']
+    latest = turns[-1] if turns and turns[-1]['role'] == 'assistant' else None
+    user_body, user_id = posted.get('body'), posted.get('id')
+    if user_body is None and users:
+        user_body, user_id = users[-1]['body'], users[-1].get('id')
+    boxes = observation.get('composer') or []
+    refs = ({'composer': {'role': 'textbox', 'name': boxes[0].get('accessibleName', '')}}
+            if len(boxes) == 1 else {})
+    return {'page': page, 'url': observation['url'], 'count': len(assistants),
+            'text': latest['body'] if latest else '', 'userCount': len(users),
+            'lastUser': users[-1]['body'] if users else '', 'refs': refs,
+            'userBody': user_body, 'userMessageId': user_id, 'postedTurns': turns,
+            'emptyDocument': bool(observation.get('emptyDocument')),
+            'generating': observation.get('generating') is True,
+            'complete': bool(latest and latest.get('complete') is True)}
+
+
+class ObservationReplay:
+    """Feed saved observations to the polling helpers; clock follows observedAt."""
+
+    def __init__(self, paths, page, min_gap=0):
+        if page is None or not page.startswith(AGENT_PAGE_PREFIX):
+            raise ValueError('Agent-driven baselines use an agent: page identity')
+        self.observations = [load_observation(p) for p in paths]
+        if not self.observations:
+            raise ValueError('Supply at least one observation')
+        times = [o['observedAt'] / 1000 for o in self.observations]
+        for before, after in zip(times, times[1:]):
+            # A repeated or rushed observation must not count as a second stable read.
+            if after - before < max(min_gap, 0.001):
+                raise ValueError('Observations must be distinct and at least %ss apart, in order' % min_gap)
+        self.page, self.times, self.index = page, times, 0
+        self.now = times[0]
+
+    def read(self, page):
+        if page != self.page:
+            raise ValueError('Browser page identity mismatch')
+        if self.index >= len(self.observations):
+            raise ObservationsExhausted()
+        observation = self.observations[self.index]
+        self.now = self.times[self.index]
+        self.index += 1
+        return page_from_observation(observation, page)
+
+    def clock(self):
+        return self.now
+
+    @property
+    def elapsed(self):
+        return self.times[-1] - self.times[0]
+
+
+def agent_capture(observation, page):
+    if not page.startswith(AGENT_PAGE_PREFIX):
+        raise ValueError('Agent-driven page identity must start with ' + AGENT_PAGE_PREFIX)
+    current = page_from_observation(observation, page)
+    check_identity(current, current)
+    if current['generating']:
+        raise ValueError('Page is generating; observe existing request before capturing a new baseline.')
+    boxes = observation.get('composer') or []
+    if len(boxes) != 1:
+        raise ValueError('Expected one composer on the owned page')
+    return {**current, 'observedAt': observation['observedAt'] / 1000,
+            'draftAtCapture': boxes[0].get('text', ''),
+            'mentionsAtCapture': boxes[0].get('mentions', []),
+            'unknownDraft': bool(normalized(boxes[0].get('text', '')))}
+
+
+def agent_check_send(baseline, message, receipt, observation, request_proof=None):
+    """Every pre-click check of submit; the agent clicks only the returned selector."""
+    if receipt.exists():
+        raise ValueError('Receipt exists: never click again; run agent-confirm on the same receipt')
+    generation = validated_generation(baseline, message, request_proof)
+    if generation is None:
+        raise ValueError('Submit HOLD: prepare a new request with its original correlation proof; not sent')
+    if observation['observedAt'] / 1000 <= baseline.get('observedAt', 0):
+        raise ValueError('Observation predates the baseline; observe again')
+    current = page_from_observation(observation, baseline['page'])
+    check_identity(current, baseline)
+    digest = hashlib.sha256(message.encode()).hexdigest()
+    if rendered_request(current, message):
+        result = {'posted': None, 'status': 'POSTING_UNCONFIRMED', 'alreadyPresent': True,
+                  'attempted': False, 'page': baseline['page'], 'url': current['url'],
+                  'messageSha256': digest, 'nextAction': 'reconcile_same_page_no_resend',
+                  'generationProof': generation, 'generationProofSha256': canonical_sha(generation)}
+        receipt.write_text(json.dumps(result, ensure_ascii=False) + '\n')
+        return result
+    if new_user_turn(current, baseline) or current['generating']:
+        raise ValueError('Page changed since capture; reconcile before sending')
+    boxes = observation.get('composer') or []
+    if len(boxes) != 1:
+        raise ValueError('Expected one composer on the owned page')
+    if normalized(boxes[0].get('text', '')) != normalized(message):
+        raise ValueError('Composer does not hold the exact prepared message; correct it and observe again; not sent')
+    chips = boxes[0].get('mentions', [])
+    state = observation.get('sendReady') or {}
+    selector = state.get('selector')
+    if state.get('ready') is not True or selector not in [
+            'form button[aria-label=' + json.dumps(name, ensure_ascii=False) + ']'
+            for name in ('보내기', 'Send', 'Send message')]:
+        raise ValueError('Send button not ready (%s); draft retained, no click' % state.get('reason', 'unknown'))
+    receipt.write_text(json.dumps({'attempted': True, 'status': 'ATTEMPTED', 'mode': 'agent',
+                                   'page': baseline['page'], 'url': current['url'], 'messageSha256': digest,
+                                   'mentions': chips, 'selector': selector,
+                                   'generationProof': generation, 'generationProofSha256': canonical_sha(generation)},
+                                  ensure_ascii=False))
+    return {'ok': True, 'status': 'READY_TO_CLICK', 'selector': selector, 'mentions': chips,
+            'nextAction': 'click_selector_once_then_agent_confirm'}
+
+
+def agent_pending(replay, timeout, interval=20):
+    if replay.elapsed >= timeout:
+        raise TimeoutError('Posting or reply remains unconfirmed/pending; reconcile the same page and request. Do not resend or report non-posting from a timeout.')
+    return {'ok': False, 'status': 'PENDING', 'observations': len(replay.observations),
+            'nextPollSeconds': interval,
+            'nextAction': 'observe_again_and_rerun_with_all_observations_no_resend'}
+
+
+def agent_confirm(baseline, message, receipt, paths, timeout=120, request_proof=None):
+    replay = ObservationReplay(paths, baseline['page'])
+    try:
+        return confirm_posting(baseline, message, receipt, timeout=timeout, read=replay.read,
+                               sleep=lambda seconds: None, clock=replay.clock, request_proof=request_proof)
+    except ObservationsExhausted:
+        return agent_pending(replay, float('inf'))
+
+
+def agent_wait(baseline, task, message, receipt, paths, timeout=600, request_proof=None):
+    replay = ObservationReplay(paths, baseline['page'], AGENT_MIN_GAP_SECONDS)
+    try:
+        return wait_reply(baseline, task, timeout, read=replay.read, sleep=lambda seconds: None,
+                          clock=replay.clock, message=message, receipt=receipt, request_proof=request_proof)
+    except ObservationsExhausted:
+        return agent_pending(replay, timeout)
+
+
 def composer(page):
     result = orca(page, 'eval', '--expression', COMPOSER_EXPRESSION)
     values = json.loads(result['result'])
@@ -939,8 +1121,34 @@ def main():
     reconcile.add_argument('--timeout', type=int, default=120, choices=range(0, 601))
     for parser in (wait, send, reconcile):
         parser.add_argument('--request-proof', type=Path)
+    sub.add_parser('observe-expression', help='Print the read-only JS an agent runs with its own browser tool')
+    a_capture = sub.add_parser('agent-capture', help='Baseline from one saved agent observation')
+    a_capture.add_argument('--observation', type=Path, required=True)
+    a_capture.add_argument('--page-id', required=True, help='agent:<stable tab label>')
+    a_capture.add_argument('--output', type=Path, required=True)
+    a_send = sub.add_parser('agent-check-send', help='Pre-click checks; writes the attempt receipt and returns the selector')
+    a_send.add_argument('--observation', type=Path, required=True)
+    a_confirm = sub.add_parser('agent-confirm', help='Replay observations after the single click')
+    a_confirm.add_argument('--timeout', type=int, default=120, choices=range(0, 601))
+    a_wait = sub.add_parser('agent-wait', help='Replay paced observations until a stable reply')
+    a_wait.add_argument('--task', required=True)
+    a_wait.add_argument('--output', type=Path, required=True)
+    a_wait.add_argument('--timeout', type=int, default=600, choices=range(20, 1801))
+    for parser in (a_send, a_confirm, a_wait):
+        parser.add_argument('--baseline', type=Path, required=True)
+        parser.add_argument('--message-file', type=Path, required=True)
+        parser.add_argument('--receipt', type=Path, required=True)
+        parser.add_argument('--request-proof', type=Path)
+    for parser in (a_confirm, a_wait):
+        parser.add_argument('--observation', type=Path, nargs='+', required=True,
+                            help='Every observation since the click, oldest first')
     args = p.parse_args()
     baseline = None
+    if args.action == 'observe-expression':
+        print(OBSERVE_EXPRESSION)
+        return 0
+    if args.action.startswith('agent-'):
+        return agent_main(args)
     try:
         if args.action == 'open':
             result = open_tab(args.url, args.worktree)
@@ -984,6 +1192,50 @@ def main():
     finally:
         if args.action == 'submit' and baseline is not None:
             keep_guarded(baseline['page'])
+
+
+def agent_main(args):
+    """Agent-driven delivery: the agent observes and clicks; this only judges."""
+    try:
+        if args.action == 'agent-capture':
+            result = agent_capture(load_observation(args.observation), args.page_id)
+            args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+            print(json.dumps({'ok': not result['unknownDraft'], 'output': str(args.output),
+                              'page': result['page'], 'url': result['url'],
+                              'unknownDraft': result['unknownDraft'],
+                              **({'draftAtCapture': result['draftAtCapture']} if result['unknownDraft'] else {})},
+                             ensure_ascii=False))
+            return 0 if not result['unknownDraft'] else 2
+        baseline, message = json.loads(args.baseline.read_text()), args.message_file.read_text()
+        if args.action == 'agent-check-send':
+            result = agent_check_send(baseline, message, args.receipt, load_observation(args.observation),
+                                      args.request_proof)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result.get('status') == 'READY_TO_CLICK' else 2
+        if args.action == 'agent-confirm':
+            result = agent_confirm(baseline, message, args.receipt, args.observation, args.timeout,
+                                   args.request_proof)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result.get('posted') is True else 3 if result.get('status') == 'PENDING' else 2
+        receipt = args.receipt if args.receipt.exists() else None
+        result = agent_wait(baseline, args.task, message, receipt, args.observation, args.timeout,
+                            args.request_proof)
+        if result.get('status') == 'PENDING':
+            print(json.dumps(result))
+            return 3
+        args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+        if result.get('type') in ('reply_mismatch', 'reply_invalid_state'):
+            print(json.dumps({'ok': False, 'type': result['type'], 'complete': False, 'output': str(args.output),
+                              'expectedIdentity': result['expectedIdentity'],
+                              'observedIdentity': result['observedIdentity'],
+                              **({'observedState': result['observedState']} if 'observedState' in result else {})}))
+            return 2
+        print(json.dumps({'ok': True, 'output': str(args.output), 'page': result['page'],
+                          'url': result['url'], 'count': result['count']}))
+        return 0
+    except (ValueError, RuntimeError, TimeoutError, OSError, KeyError) as error:
+        print(json.dumps({'ok': False, 'error': str(error)}))
+        return 2
 
 
 if __name__ == '__main__':

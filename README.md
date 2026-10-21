@@ -25,7 +25,7 @@ This is a skill/workflow package, **not a replacement MCP server, OAuth provider
 - Codex or Claude Code with user-skill support.
 - A compatible `c2c` / `code-with-chatgpt` transport, such as [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt), installed separately.
 - Access to ChatGPT web and the connector features required by your account.
-- A browser integration for automatic message delivery. Orca is supported through its installed browser guide; other integrations can be used explicitly. Without one, delivery is manual.
+- A browser integration for automatic message delivery. With Orca the helper drives the tab itself. With any other browser tool that can run page JavaScript and click (for example Claude in Chrome or a Playwright MCP server), the agent drives the tab and the helper judges its saved DOM observations (agent-driven mode). Without one, delivery is manual.
 
 Compatibility depends on the installed transport exposing `status --json`, `session get/set`, `record`, and a workspace-info tool. Check command help before setup or repair; those operations may change local services.
 
