@@ -209,7 +209,7 @@ same page instead of resending. Capture each new request into a distinct file.
 
 A separate terminal `type: reply_mismatch` is available only after the original full request-generation bindings, page/conversation identity, exact authored user body, confirmed receipt's pinned user ID and unique associated assistant identity pass. The completed assistant must be explicitly non-generating and have one canonical authored header containing TASK_ID, WORKSPACE_ID, ITERATION, REQUEST_ID and one explicit STATE, with an explicit identity conflict. Two consecutive reads at the normal polling interval must match page/URL, user/reply IDs, full authored bodies and expected/observed conflict. Blank/read errors, renewed generation, incomplete output, body or association changes reset negative stability; actual identity drift retains the existing fail-closed stop. Missing or quoted/body-only headers remain unqualified, and a corrected valid reply still needs the unchanged positive two-read rule. Baseline body equality cannot suppress a precisely associated explicit conflict.
 
-A separate `type: reply_invalid_state` uses the same original generation bindings, pinned user ID, unique canonical authored header, explicit non-generation, response completion and two consecutive stable full reads. All four IDs must match exactly, and one authored STATE must be outside `PLAN`, `REVISE`, `DONE`, or `BLOCKED`. It preserves the rejected response and observed state, exits 2, and never sends. An explicit ID conflict has priority even when STATE is also invalid. Missing, duplicate, quoted or ambiguous headers remain unqualified; ordinary read errors, blank pages, generation and body changes reset stability. `EXECUTING` is a transport checkpoint state, not a terminal review reply state. Instructions requesting a review must use the four supported reply states.
+A separate `type: reply_invalid_state` uses the same original generation bindings, pinned user ID, unique canonical authored header, explicit non-generation, response completion and two consecutive stable full reads. All four IDs must match exactly, and one authored STATE must be outside `PLAN`, `REVISE`, `DONE`, or `BLOCKED`. It preserves the rejected response and observed state, exits 2, and never sends. An explicit ID conflict has priority even when STATE is also invalid. Missing, duplicate, quoted or ambiguous headers remain unqualified; ordinary read errors, blank pages, generation and body changes reset stability. `EXECUTING` is a bridge checkpoint state, not a terminal review reply state. Instructions requesting a review must use the four supported reply states.
 
 The refused result preserves the full original reply/raw snapshot, original generation proof and expected/observed identities under `rejectedResponse` and the result's proof fields. `rejectedResponse.complete=true` records observed completion; top-level `ok=false` and `complete=false` mean the reply was not admitted for this request. The CLI writes that refused result and exits 2 without sending or modifying receipts. Codex and Claude each retain their own unchanged adjacent producer and producer-name/hash bindings; an actual proof from one provider must never be relabelled or grafted into the other's receipt.
 
@@ -220,7 +220,7 @@ A same-page empty `about:blank` (or an empty snapshot at the pinned URL) is a tr
 ## Source-preserving validation
 
 After receiving and evaluating the PLAN, save it outside the repository, and save
-the matching transport checkpoint as PLAN_RECEIVED (or EXECUTING when resuming).
+the matching bridge checkpoint as PLAN_RECEIVED (or EXECUTING when resuming).
 Write the commands you reviewed as JSON argv arrays, for example:
 
 ```json
@@ -231,7 +231,7 @@ Write the commands you reviewed as JSON argv arrays, for example:
 Run with a new evidence directory outside the tested workspace:
 
 ```sh
-python3 <skill-dir>/scripts/evidence.py --workspace <repo> --task <task-id> --iteration <n> --plan-file <actual-plan-file> --spec <commands.json> --output <outside-repo>/execution --bridge __BRIDGE__
+python3 <skill-dir>/scripts/evidence.py --workspace <repo> --task <task-id> --iteration <n> --plan-file <actual-plan-file> --spec <commands.json> --output <outside-repo>/execution 
 ```
 
 It requires the current matching PLAN/EXECUTING checkpoint, records HEAD, branch
@@ -240,7 +240,7 @@ file SHA-256, status, staged/unstaged diff, and hashes of tracked/untracked
 nonignored files. Its git reads use a private index copy, so observing never
 rewrites `.git/index`; an index change during observation fails the snapshot. It executes argv without a shell with bytecode disabled; captures real exit
 codes; compares the after-state; and attaches every command plus before/after/
-comparison as separate retrievable transport outputs. Dirty baselines are valid.
+comparison as separate retrievable bridge outputs. Dirty baselines are valid.
 State these covered items in the PLAN request so the reviewer does not ask for a
 separate manual collection. Symlinks are recorded without reading their targets. Submodules need a task-specific
 verifier and are rejected. Ignored files are outside this helper's preservation
@@ -251,7 +251,7 @@ use normal scoped evidence collection instead.
 Read the record receipts and have the reviewer retrieve every relevant raw output
 (including before/after/comparison). Transport exit zero alone is not proof the
 reviewer accessed the outputs. If a record fails, inspect its receipt and the
-transport before retrying; do not silently duplicate an uncertain write. A failed
+bridge before retrying; do not silently duplicate an uncertain write. A failed
 command or preservation comparison remains failure even when upload succeeded.
 Never manufacture a prior baseline after execution. Never mark DONE from helper
 success alone; require actual final review and consistent checkpoint readback.

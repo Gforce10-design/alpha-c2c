@@ -1,7 +1,7 @@
 # Resume an existing collaboration
 
 Read the task ID, conversation URL, and checkpoint from `session get -w <path> --json`.
-Keep the transport's checkpoint as the source of truth instead of creating a competing state store.
+Keep the bridge's checkpoint as the source of truth instead of creating a competing state store.
 Do not claim another session's tab based only on a matching title.
 
 | protocolState | Next action |
@@ -25,12 +25,12 @@ Summarize the next action from a saved JSON response:
 python3 <skill-dir>/scripts/c2c.py resume --session-file <response.json>
 ```
 
-Supported checkpoint updates in the compatible transport:
+Supported checkpoint updates in the bundled bridge:
 
 ```sh
-code-with-chatgpt session set -w <path> --task <id> --protocol-state EXECUTING --waiting-for none
-code-with-chatgpt session set -w <path> --task <id> --protocol-state EXECUTED_LOCAL --waiting-for none
-code-with-chatgpt session set -w <path> --task <id> --protocol-state EXECUTED_SENT --waiting-for GPT_REVIEW
+python3 <skill-dir>/scripts/bridge.py session set -w <path> --task <id> --protocol-state EXECUTING --waiting-for none
+python3 <skill-dir>/scripts/bridge.py session set -w <path> --task <id> --protocol-state EXECUTED_LOCAL --waiting-for none
+python3 <skill-dir>/scripts/bridge.py session set -w <path> --task <id> --protocol-state EXECUTED_SENT --waiting-for GPT_REVIEW
 ```
 
 Use EXECUTING immediately before execution, EXECUTED_LOCAL after recording real results, and EXECUTED_SENT only after the message is visibly posted.

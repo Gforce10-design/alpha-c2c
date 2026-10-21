@@ -99,11 +99,13 @@ class BehaviorTests(unittest.TestCase):
                         self.assertNotIn("secret", str(error.exception))
 
     def test_each_package_selects_its_own_executor(self):
-        for client, executable in (("codex", "c2c"), ("claude", "code-with-chatgpt")):
+        for client in ("codex", "claude"):
             module = next(m for m in MODULES if m.__name__ == client)
             with patch.object(module, "query_status", return_value={}) as query, patch("builtins.print"):
                 self.assertEqual(module.main(["status", "--workspace", "."]), 0)
-                self.assertEqual(query.call_args.args[1], executable)
+                # Both packages use their own bundled bridge, labelled for their executor.
+                self.assertEqual(query.call_args.args[1:], (None, client))
+                self.assertEqual(module.BRIDGE.parent.parent.name, "alpha-c2c-" + client)
 
 
 class PackagingTests(unittest.TestCase):

@@ -8,6 +8,7 @@ import shlex
 import stat
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -98,7 +99,7 @@ def require_plan(session, task, iteration, plan):
 
 
 def record(bridge, workspace, task, iteration, path, command, code, changed):
-    result = subprocess.run([bridge, 'record', '-w', str(workspace), '--task', task,
+    result = subprocess.run([*bridge, 'record', '-w', str(workspace), '--task', task,
         '--iteration', str(iteration), '--changed-files', str(changed), '--tests', 'See attached actual output',
         '--exit-status', 'ok' if code == 0 else 'failed', '--command', command,
         '--output-file', str(path), '--exit-code', str(code)], capture_output=True, text=True)
@@ -147,20 +148,21 @@ def main():
     p.add_argument('--plan-file', type=Path, required=True)
     p.add_argument('--spec', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--bridge', default='__BRIDGE__')
+    p.add_argument('--bridge', help='Another bridge executable; default is scripts/bridge.py beside this file')
     a = p.parse_args()
+    bridge = [a.bridge] if a.bridge else [sys.executable, str(Path(__file__).resolve().with_name('bridge.py'))]
     workspace, output = a.workspace.resolve(), a.output.resolve()
     try:
         if output == workspace or workspace in output.parents:
             raise ValueError('Evidence output must be outside the tested workspace')
-        session = json.loads(subprocess.check_output([a.bridge, 'session', 'get', '-w', str(workspace), '--json']))
+        session = json.loads(subprocess.check_output([*bridge, 'session', 'get', '-w', str(workspace), '--json']))
         require_plan(session, a.task, a.iteration, a.plan_file)
         results, comparison = execute(workspace, output, json.loads(a.spec.read_text()))
         changed = int(not comparison['identical'])
         for item in results:
-            record(a.bridge, workspace, a.task, a.iteration, Path(item['output']), shlex.join(item['argv']), item['exitCode'], changed)
+            record(bridge, workspace, a.task, a.iteration, Path(item['output']), shlex.join(item['argv']), item['exitCode'], changed)
         for name in ('before.json', 'after.json', 'comparison.json'):
-            record(a.bridge, workspace, a.task, a.iteration, output / name,
+            record(bridge, workspace, a.task, a.iteration, output / name,
                    f'evidence.py {name} (HEAD, branch symbolic ref, refs, index entries, raw .git/index SHA256, status, diffs, source SHA256)', changed, changed)
         ok = not changed and all(item['exitCode'] == 0 for item in results)
         print(json.dumps({'ok': ok, 'output': str(output), 'preserved': not changed, 'commands': results}))

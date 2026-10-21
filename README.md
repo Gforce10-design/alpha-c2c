@@ -2,32 +2,40 @@
 
 **ChatGPT plans and reviews. Your coding agent builds and tests.**
 
-Two standalone skills for collaborating with ChatGPT web from **Codex** or **Claude Code**. The workflow and CLI guidance are written in English. User-facing responses follow the user's language instead of inheriting a transport's hard-coded locale.
+Two standalone skills for collaborating with ChatGPT web from **Codex** or **Claude Code**. The workflow and CLI guidance are written in English. User-facing responses follow the user's language instead of a hard-coded locale.
 
-| Package | Coding agent | Connection executable | Invocation |
+| Package | Coding agent | ChatGPT connector name | Invocation |
 | --- | --- | --- | --- |
-| `alpha-c2c-codex` | Codex | `c2c` | `$alpha-c2c-codex` |
-| `alpha-c2c-claude` | Claude Code | `code-with-chatgpt` | `/alpha-c2c-claude` |
+| `alpha-c2c-codex` | Codex | `Alpha C2C Codex · <workspace>` | `$alpha-c2c-codex` |
+| `alpha-c2c-claude` | Claude Code | `Alpha C2C Claude · <workspace>` | `/alpha-c2c-claude` |
 
 ## What it does
 
 - Keeps planning/review in ChatGPT web and execution in the coding agent.
 - Requires an actual workspace tool result before treating a connection as ready.
 - Resumes saved work without automatically repeating an already-sent message or completed execution.
-- Summarizes transport status without forwarding raw locale-specific messages or authentication data.
+- Summarizes bridge status without forwarding raw locale-specific messages or authentication data.
 - Loads connection, browser, and resume details only when needed.
 
-This is a skill/workflow package, **not a replacement MCP server, OAuth provider, tunnel, or browser driver**. It uses an existing compatible connection transport. It does not install or reset that transport, modify account settings, or migrate active conversations.
+Each skill bundles its own connection, `scripts/bridge.py`: a read-only MCP connector for one workspace, with OAuth pairing and a Cloudflare quick tunnel, written with the Python standard library only. No other C2C tool is needed. The bridge never writes to the workspace or runs commands for the reviewer, and the skill does not modify account settings or migrate active conversations.
 
 ## Requirements
 
-- Python 3.10+ for the optional helpers and installer; no Python dependencies.
+- Python 3.10+ and `git`; no Python packages.
 - Codex or Claude Code with user-skill support.
-- A compatible `c2c` / `code-with-chatgpt` transport, such as [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt), installed separately.
-- Access to ChatGPT web and the connector features required by your account.
+- [`cloudflared`](https://github.com/cloudflare/cloudflared) (for example `brew install cloudflared`). ChatGPT only connects to public HTTPS addresses; the bridge uses a free quick tunnel, so no Cloudflare account is needed.
+- A ChatGPT plan that allows custom connectors (developer mode). You are responsible for using ChatGPT within OpenAI's terms; this project only automates your own browser session.
 - A browser integration for automatic message delivery. With Orca the helper drives the tab itself. With a regular Chrome started with remote debugging on 127.0.0.1, the same helper drives it over the Chrome DevTools Protocol (standard library only). With any other browser tool that can run page JavaScript and click (for example Claude in Chrome or a Playwright MCP server), the agent drives the tab and the helper judges its saved DOM observations (agent-driven mode). Without one, delivery is manual.
 
-Compatibility depends on the installed transport exposing `status --json`, `session get/set`, `record`, and a workspace-info tool. Check command help before setup or repair; those operations may change local services.
+## Connect a workspace
+
+```sh
+python3 <skill-dir>/scripts/bridge.py setup -w <repo> --json
+```
+
+This starts the bridge and tunnel and prints `connectorName`, `mcpUrl` and a five-minute pairing code. In ChatGPT (developer mode on), create a connector with that name and URL and OAuth authentication; on the sign-in page, type the pairing code. `status --json` is read-only, `doctor --json` checks and restarts what is missing, `unpair` revokes access, `stop` shuts it down. A quick-tunnel address changes when the bridge restarts; `doctor` tells you when the connector URL needs updating. The agent runs these steps for you when you ask it to set up C2C.
+
+The reviewer gets nine read-only tools: workspace info, directory listing, file reading, search, git status, git diff, and the recorded test/execution evidence. `.env`, keys and credentials are always denied, and you can add patterns to a `.c2cignore` file. Tokens, sessions and evidence are stored outside the repository, owner-only, in the platform's app-state directory.
 
 ## Install
 
@@ -63,7 +71,7 @@ python3 scripts/install.py --dry-run  # show where it would install
 
 The installer follows each client's own settings: Claude Code uses `$CLAUDE_CONFIG_DIR/skills` when that variable is set, otherwise `~/.claude/skills`; Codex uses `$CODEX_HOME/skills` when set, otherwise `~/.agents/skills`. If the skill is already installed in one of those places, that location is reused, so no second copy appears. Choose explicitly with `--client codex|claude|all` or `--skills-dir <dir>`.
 
-Installation is idempotent. If an existing copy differs, the installer stops; `--update` first moves the old copy to `.alpha-c2c-backups/` next to the skills directory (outside it, so it is never loaded twice), then installs. It refuses to replace a directory that is not this skill or a symlink. After installing it reminds you if the `c2c` / `code-with-chatgpt` transport is missing. Start a new agent session afterwards. Uninstall by removing only the installed `alpha-c2c-codex` or `alpha-c2c-claude` directory (or `/plugin uninstall alpha-c2c`); transport and account settings are separate.
+Installation is idempotent. If an existing copy differs, the installer stops; `--update` first moves the old copy to `.alpha-c2c-backups/` next to the skills directory (outside it, so it is never loaded twice), then installs. It refuses to replace a directory that is not this skill or a symlink. After installing it reminds you if `cloudflared` is missing. Start a new agent session afterwards. Uninstall by removing only the installed `alpha-c2c-codex` or `alpha-c2c-claude` directory (or `/plugin uninstall alpha-c2c`); bridge state and ChatGPT connectors are separate (`bridge.py unpair` first if you want access revoked).
 
 Machine-specific additions (private workflows, local paths, notes) belong in `~/.config/alpha-c2c/local.md` (or `$XDG_CONFIG_HOME/alpha-c2c/local.md`, or any file named by `$ALPHA_C2C_LOCAL`), not in the installed `SKILL.md`. The skill reads that file at start, and installs or updates never touch it.
 
@@ -115,10 +123,10 @@ python3 scripts/build.py --check
 python3 -m unittest discover -s tests -v
 ```
 
-Tests cover both executors, non-English transport messages, malformed checkpoints, repeat prevention recommendations, argument boundaries, multilingual prompts, and non-destructive installation. They do not establish a live ChatGPT login, browser exchange, or end-to-end review. Validate those separately in your own task-owned conversation.
+Tests cover both executors, the bridge's OAuth pairing and MCP tools over real local HTTP, workspace and secret boundaries, non-English messages, malformed checkpoints, repeat prevention recommendations, argument boundaries, multilingual prompts, and non-destructive installation. They do not establish a live ChatGPT login, browser exchange, or end-to-end review. Validate those separately in your own task-owned conversation.
 
 ## Provenance
 
-The workflow instructions and Python helpers in this repository were written for Alpha C2C. The external transport is a separate project with its own authors and license. This repository does not vendor its implementation or claim ownership of it. Transport command names describe integration points, not copied source.
+The workflow, helpers and bridge in this repository were written for Alpha C2C in Python. The bridge's command names, tool names and pairing flow follow the design of [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) (MIT), which inspired this project; no source was copied from it, and it is not required.
 
 MIT license. Contributions should keep the entrypoints short, use English documentation, respect the user's language, and include observable tests for behavior changes.

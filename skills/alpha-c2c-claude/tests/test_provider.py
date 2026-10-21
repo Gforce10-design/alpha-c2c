@@ -23,17 +23,18 @@ w = load('provider_waiter', 'wait_reply.py')
 
 
 class ProviderTests(unittest.TestCase):
-    def test_default_and_explicit_status_keep_native_transport(self):
+    def test_default_status_uses_the_bundled_bridge(self):
         for extra in ([], ['--executor', EXECUTOR]):
             with self.subTest(extra=extra), patch.object(p, 'query_status', return_value={}) as query, patch('sys.stdout'):
                 self.assertEqual(p.main(['status', '--workspace', str(ROOT)] + extra), 0)
-                query.assert_called_once_with(ROOT, 'code-with-chatgpt', EXECUTOR)
+                query.assert_called_once_with(ROOT, None, EXECUTOR)
+        self.assertTrue(p.BRIDGE.is_file())
 
     def test_status_names_the_executor_connector_and_never_the_other_one(self):
         data = {'ok': True, 'running': True, 'tokenCount': 3, 'workspaceName': 'claude-code-book'}
         self.assertEqual(p.status_summary(data)['expectedConnector'], p.expected_connector(EXECUTOR, 'claude-code-book'))
-        self.assertEqual(p.status_summary(data, 'claude')['expectedConnector'], 'Code with ChatGPT · claude-code-book')
-        self.assertEqual(p.status_summary(data, 'codex')['expectedConnector'], 'Codex with ChatGPT · claude-code-book')
+        self.assertEqual(p.status_summary(data, 'claude')['expectedConnector'], 'Alpha C2C Claude · claude-code-book')
+        self.assertEqual(p.status_summary(data, 'codex')['expectedConnector'], 'Alpha C2C Codex · claude-code-book')
         self.assertNotIn('expectedConnector', p.status_summary({'ok': True, 'running': True, 'tokenCount': 3}))
 
     def test_real_prepared_producer_cannot_be_relabelled_as_other_executor(self):
