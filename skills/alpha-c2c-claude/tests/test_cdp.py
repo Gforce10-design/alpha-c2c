@@ -190,6 +190,22 @@ class VerbTests(unittest.TestCase):
         with patch.object(w, 'orca', return_value={'result': json.dumps({'schema': 'other'})}), self.assertRaises(RuntimeError):
             w.read_page('cdp:T')
 
+    def test_transport_failures_are_transient_not_verdicts(self):
+        class Refused(FakeSession):
+            def __init__(self, target_id):
+                raise ConnectionRefusedError('refused')
+
+        class Slow(FakeSession):
+            def evaluate(self, expression):
+                raise TimeoutError('timed out')
+
+        for session in (Refused, Slow):
+            module = type('Module', (), {'Session': session, 'CDPError': c.CDPError})
+            with self.subTest(session=session.__name__), patch.object(w, '_cdp', return_value=module):
+                with self.assertRaises(RuntimeError):
+                    w.orca('cdp:T', 'eval', '--expression', '1')
+                self.assertIsNone(w.keep_guarded('cdp:T'))
+
     def test_open_creates_cdp_page_and_guards_it(self):
         class Module:
             @staticmethod
