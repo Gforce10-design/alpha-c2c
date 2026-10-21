@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -246,6 +247,30 @@ class HttpTests(Fixture):
         return self.call('POST', '/mcp', message, {'Authorization': 'Bearer ' + token,
                                                    'Accept': 'application/json, text/event-stream'})
 
+    def test_unread_bodies_never_desynchronize_a_pooled_connection(self):
+        body = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
+        request = (b'POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s'
+                   % (len(body), body))
+        with socket.create_connection(('127.0.0.1', self.server.port), timeout=5) as sock:
+            sock.sendall(request + b'GET /health HTTP/1.1\r\nHost: x\r\n\r\n')
+            data = b''
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        self.assertTrue(data.startswith(b'HTTP/1.1 401'))
+        self.assertIn(b'Connection: close', data)
+        self.assertNotIn(b'HTTP/1.1 400', data)
+
+    def test_chunked_request_bodies_are_read(self):
+        payload = json.dumps({'redirect_uris': ['https://chatgpt.com/cb']}).encode()
+        chunked = b''.join(b'%x\r\n%s\r\n' % (len(part), part) for part in (payload[:10], payload[10:])) + b'0\r\n\r\n'
+        with socket.create_connection(('127.0.0.1', self.server.port), timeout=5) as sock:
+            sock.sendall(b'POST /oauth/register HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n'
+                         b'Transfer-Encoding: chunked\r\n\r\n' + chunked)
+            self.assertTrue(sock.recv(65536).startswith(b'HTTP/1.1 201'))
+
     def test_discovery_points_at_this_server(self):
         status, _, body = self.call('GET', '/.well-known/oauth-protected-resource/mcp')
         self.assertEqual(json.loads(body)['resource'], self.base + '/mcp')
@@ -317,6 +342,17 @@ class TunnelTests(unittest.TestCase):
             finally:
                 tunnel.stop()
             self.assertFalse(tunnel.running())
+
+    def test_dns_answers_are_parsed_without_the_os_resolver(self):
+        header = (0x1234).to_bytes(2, 'big') + b'\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00'
+        question = b'\x05quiet\x0dtrycloudflare\x03com\x00\x00\x01\x00\x01'
+        cname = b'\xc0\x0c\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x02\xc0\x0c'
+        a_record = b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x68\x10\x00\x01'
+        self.assertEqual(b.parse_a(header + question + cname + a_record, 0x1234), ['104.16.0.1'])
+        self.assertEqual(b.parse_a(header + question + a_record, 0x9999), [])
+        nxdomain = header[:3] + b'\x83' + header[4:]
+        self.assertEqual(b.parse_a(nxdomain + question, 0x1234), [])
+        self.assertFalse(b.probe_health('https://quiet.trycloudflare.com', 'ws', resolve=lambda host: []))
 
     def test_missing_cloudflared_is_reported(self):
         with patch.object(b, 'find_cloudflared', return_value=None), self.assertRaisesRegex(RuntimeError, 'cloudflared'):

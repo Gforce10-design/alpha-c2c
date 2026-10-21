@@ -91,7 +91,7 @@ def save(path, data):
 
 
 def require_plan(session, task, iteration, plan):
-    cp = session.get('session', {}).get('checkpoint', {})
+    cp = (session.get('session') or {}).get('checkpoint') or {}
     if (session.get('ok') is not True or cp.get('taskId') != task or cp.get('iteration') != iteration
             or cp.get('protocolState') not in ('PLAN_RECEIVED', 'EXECUTING')
             or not plan.is_file() or not plan.read_text().strip()):

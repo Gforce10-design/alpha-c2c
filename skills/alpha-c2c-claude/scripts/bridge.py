@@ -11,6 +11,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -408,7 +410,8 @@ def valid_redirect(uri):
 
 
 def pkce_ok(verifier, challenge):
-    return bool(verifier) and hmac.compare_digest(b64url(hashlib.sha256(verifier.encode()).digest()), challenge or '')
+    return bool(verifier) and hmac.compare_digest(b64url(hashlib.sha256(verifier.encode()).digest()).encode(),
+                                                  (challenge or '').encode())
 
 
 def html_escape(value):
@@ -572,14 +575,85 @@ def find_cloudflared():
     return None
 
 
-def probe_health(url, workspace_id, timeout=5):
+def dns_servers():
+    configured = [s.strip() for s in os.environ.get('ALPHA_C2C_DNS_SERVERS', '').split(',') if s.strip()]
+    return configured or ['1.1.1.1', '8.8.8.8']
+
+
+def resolve_a(hostname, servers=None, timeout=1.5):
+    """A records straight from public resolvers. A fresh quick-tunnel name is not in DNS for some
+    seconds; asking the OS resolver too early caches the miss (macOS kept it past 24s), so the
+    bridge never resolves tunnel names through getaddrinfo."""
+    ident = secrets.randbits(16)
+    question = b''.join(bytes([len(p)]) + p.encode('idna') for p in hostname.rstrip('.').split('.')) + b'\0'
+    packet = ident.to_bytes(2, 'big') + b'\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00' + question + b'\x00\x01\x00\x01'
+    for server in servers or dns_servers():
+        try:
+            with socket.socket(socket.AF_INET6 if ':' in server else socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(timeout)
+                sock.sendto(packet, (server, 53))
+                reply = sock.recv(4096)
+        except OSError:
+            continue
+        addresses = parse_a(reply, ident)
+        if addresses:
+            return addresses
+    return []
+
+
+def parse_a(reply, ident):
+    if len(reply) < 12 or int.from_bytes(reply[:2], 'big') != ident or reply[3] & 0x0F:
+        return []
+    count, offset = int.from_bytes(reply[6:8], 'big'), 12
+
+    def skip_name(at):
+        while at < len(reply):
+            size = reply[at]
+            if size == 0:
+                return at + 1
+            if size & 0xC0 == 0xC0:
+                return at + 2
+            at += size + 1
+        raise ValueError('truncated')
     try:
-        request = urllib.request.Request(url.rstrip('/') + '/health', headers={'User-Agent': SERVICE})
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read(65536).decode('utf-8'))
-    except (OSError, ValueError):
+        for _ in range(int.from_bytes(reply[4:6], 'big')):
+            offset = skip_name(offset) + 4
+        found = []
+        for _ in range(count):
+            offset = skip_name(offset)
+            kind, size = int.from_bytes(reply[offset:offset + 2], 'big'), int.from_bytes(reply[offset + 8:offset + 10], 'big')
+            data = reply[offset + 10:offset + 10 + size]
+            if kind == 1 and size == 4:
+                found.append(socket.inet_ntoa(data))
+            offset += 10 + size
+        return found
+    except (ValueError, IndexError, OSError):
+        return []
+
+
+def probe_health(url, workspace_id, timeout=5, resolve=resolve_a):
+    """GET <url>/health over HTTPS to a directly resolved address, keeping certificate checks for the name."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != 'https' or not parts.hostname:
         return False
-    return data.get('service') == SERVICE and data.get('status') == 'ok' and data.get('workspaceId') == workspace_id
+    for address in resolve(parts.hostname):
+        context = ssl.create_default_context()
+        connection = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout, context=context)
+        try:
+            raw = socket.create_connection((address, parts.port or 443), timeout)
+            connection.sock = context.wrap_socket(raw, server_hostname=parts.hostname)
+            connection.request('GET', '/health', headers={'User-Agent': SERVICE, 'Host': parts.netloc})
+            response = connection.getresponse()
+            if response.status != 200:
+                continue
+            data = json.loads(response.read(65536).decode('utf-8'))
+        except (OSError, ValueError, http.client.HTTPException):
+            continue
+        finally:
+            connection.close()
+        if data.get('service') == SERVICE and data.get('status') == 'ok' and data.get('workspaceId') == workspace_id:
+            return True
+    return False
 
 
 class QuickTunnel:
@@ -616,13 +690,15 @@ class QuickTunnel:
         if not ready.wait(self.timeout) or not found:
             self.stop()
             raise RuntimeError('cloudflared did not report a tunnel address.')
+        wait = 1.0
         while now() < deadline:
             if self.process.poll() is not None:
                 break
             if self.health(found[0], self.workspace_id):
                 self.url = found[0]
                 return self.url
-            time.sleep(0.25)
+            time.sleep(min(wait, max(deadline - now(), 0)))
+            wait = min(wait * 1.5, 5.0)
         self.stop()
         raise RuntimeError('The tunnel address never answered the bridge health check.')
 
@@ -717,7 +793,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(body, ensure_ascii=False).encode()
         elif isinstance(body, str):
             body = body.encode()
+        self.close_connection = True  # A pooled connection with an unread body would desynchronize.
         self.send_response(status)
+        self.send_header('Connection', 'close')
         self.send_header('Content-Type', kind + ('; charset=utf-8' if kind.startswith(('text/', 'application/json')) else ''))
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
@@ -729,6 +807,18 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def body(self):
+        if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
+            data = b''
+            while True:
+                size = int(self.rfile.readline(64).split(b';')[0].strip() or b'0', 16)
+                if size == 0:
+                    while self.rfile.readline(1024) not in (b'\r\n', b'\n', b''):
+                        pass
+                    return data
+                if len(data) + size > MAX_BODY:
+                    raise ValueError('too large')
+                data += self.rfile.read(size)
+                self.rfile.readline(8)
         size = int(self.headers.get('Content-Length') or 0)
         if size > MAX_BODY:
             raise ValueError('too large')
@@ -820,7 +910,7 @@ class Handler(BaseHTTPRequestHandler):
         forwarded = any(self.headers.get(h) for h in ('Cf-Connecting-Ip', 'X-Forwarded-For', 'Cf-Ray', 'Forwarded'))
         token = (self.headers.get('Authorization') or '')[len('Bearer '):]
         return (self.client_address[0] in ('127.0.0.1', '::1') and not forwarded
-                and hmac.compare_digest(token, self.server.admin_token))
+                and hmac.compare_digest(token.encode(), self.server.admin_token.encode()))
 
     def admin_post(self, path):
         s = self.server
