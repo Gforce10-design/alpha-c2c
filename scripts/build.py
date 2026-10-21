@@ -21,6 +21,8 @@ def build(check=False):
             relative = source.relative_to(ROOT / "src/skill-template")
             if client == "claude" and relative.parts[0] == "agents":
                 continue
+            if client == "codex" and relative.parts[0] == ".claude-plugin":
+                continue
             target = dest / relative
             expected.add(target)
             content = source.read_text(encoding="utf-8")
