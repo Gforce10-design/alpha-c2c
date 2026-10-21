@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import uuid
+import os
 import json
 import re
 import shutil
@@ -35,9 +38,27 @@ def nonnegative_int(value: object) -> bool:
     return type(value) is int and value >= 0
 
 
-def status_summary(data: object) -> dict:
+CONNECTOR_PREFIX = {"claude": "Code with ChatGPT", "codex": "Codex with ChatGPT"}
+
+
+def expected_connector(executor: str, workspace_name: object) -> str | None:
+    """Connector label this executor must attach; the other executor's label is never a substitute."""
+    if not isinstance(workspace_name, str) or not workspace_name.strip():
+        return None
+    return f"{CONNECTOR_PREFIX[executor]} · {workspace_name.strip()}"
+
+
+def status_summary(data: object, executor: str = "codex") -> dict:
     """Allowlist fields; never forward arbitrary provider messages or credentials."""
     d = object_value(data)
+    summary = _status_state(d)
+    connector = expected_connector(executor, d.get("workspaceName"))
+    if connector:
+        summary["expectedConnector"] = connector
+    return summary
+
+
+def _status_state(d: dict) -> dict:
     running = d.get("running")
     if running is False:
         state, message = "stopped", "The bridge is not running. No changes were made."
@@ -113,7 +134,47 @@ def message(kind: str, task: str, workspace_id: str, language: str, iteration: i
     )
 
 
-def query_status(workspace: Path, executable: str) -> dict:
+def canonical_sha(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                     separators=(',', ':')).encode()).hexdigest()
+
+
+def prepare_request(kind, task, workspace_id, language, iteration, content, baseline_path, output, proof_path):
+    """Create a new local correlation record, never a posting/authentication receipt."""
+    baseline = object_value(json.loads(baseline_path.read_text(encoding='utf-8')))
+    if not all(isinstance(baseline.get(k), str) and baseline[k] for k in ('page', 'url')):
+        raise InputError('Capture an exact page and URL before preparing a request.')
+    if baseline.get('generating'):
+        raise InputError('Baseline is generating; retain its existing request.')
+    if output.resolve() == proof_path.resolve() or output.exists() or proof_path.exists():
+        raise InputError('Request/proof destinations must be distinct new files; existing files were preserved.')
+    body = message(kind, task, workspace_id, language, iteration, content)
+    nonce = 'request-' + str(uuid.uuid4())
+    header = {'TASK_ID': task, 'WORKSPACE_ID': workspace_id, 'ITERATION': str(iteration), 'REQUEST_ID': nonce}
+    request = ' '.join(k + ': ' + v for k, v in header.items()) + '\n\n'
+    request += 'Begin your authored response with this exact TASK_ID, WORKSPACE_ID, ITERATION and REQUEST_ID, then STATE.\n' + body
+    proof = {'schema': 'c2c-prepared-request-v1', 'status': 'preparing',
+             'producer': 'alpha-c2c-codex/scripts/c2c.py',
+             'producerSha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+             'messageSha256': hashlib.sha256(request.encode()).hexdigest(),
+             'baselineSha256': canonical_sha(baseline), 'page': baseline['page'], 'url': baseline['url'],
+             'identity': header}
+    # Exclusive creation preserves unknown files and exposes incomplete own artifacts.
+    with proof_path.open('x', encoding='utf-8') as proof_file:
+        proof_file.write(json.dumps(proof, ensure_ascii=False) + '\n'); proof_file.flush(); os.fsync(proof_file.fileno())
+        try:
+            with output.open('x', encoding='utf-8') as message_file:
+                message_file.write(request); message_file.flush(); os.fsync(message_file.fileno())
+            proof['status'] = 'prepared'
+        except OSError as error:
+            proof['status'] = 'creation_failed'; proof['errorType'] = type(error).__name__
+            proof_file.seek(0); proof_file.truncate(); proof_file.write(json.dumps(proof) + '\n'); proof_file.flush()
+            raise
+        proof_file.seek(0); proof_file.truncate(); proof_file.write(json.dumps(proof, ensure_ascii=False) + '\n'); proof_file.flush(); os.fsync(proof_file.fileno())
+    return {'prepared': True, 'output': str(output), 'requestProof': str(proof_path), 'messageSha256': proof['messageSha256']}
+
+
+def query_status(workspace: Path, executable: str, executor: str = "codex") -> dict:
     workspace = workspace.expanduser().resolve()
     if not workspace.is_dir():
         raise InputError("Workspace directory does not exist.")
@@ -130,7 +191,7 @@ def query_status(workspace: Path, executable: str) -> dict:
     if result.returncode:
         raise InputError(f"Status query failed (exit {result.returncode}). Inspect the transport locally; its raw output was not forwarded.")
     try:
-        return status_summary(json.loads(result.stdout))
+        return status_summary(json.loads(result.stdout), executor)
     except (json.JSONDecodeError, InputError):
         raise InputError("Transport returned an unsupported status response. Its raw output was not forwarded.") from None
 
@@ -150,20 +211,30 @@ def main(argv: list[str] | None = None) -> int:
     msg.add_argument("--workspace-id", required=True)
     msg.add_argument("--language", default="English")
     msg.add_argument("--iteration", type=int, default=0)
+    msg.add_argument("--baseline", type=Path)
+    msg.add_argument("--output", type=Path)
+    msg.add_argument("--request-proof", type=Path)
     content = msg.add_mutually_exclusive_group(required=True)
     content.add_argument("--goal-file", type=Path)
     content.add_argument("--summary-file", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
-            default = "c2c" if args.executor == "codex" else "code-with-chatgpt"
-            output = query_status(args.workspace, args.bridge or default)
+            default = "c2c" if args.executor == "codex" else "c2c"
+            output = query_status(args.workspace, args.bridge or default, args.executor)
         elif args.command == "resume":
             output = resume_summary(json.loads(args.session_file.read_text(encoding="utf-8")))
         else:
             path = args.goal_file if args.kind == "plan" else args.summary_file
             if path is None:
                 raise InputError("Use --goal-file for plan and --summary-file for review.")
+            flags = (args.baseline, args.output, args.request_proof)
+            if any(flags):
+                if not all(flags):
+                    raise InputError('Use --baseline, --output and --request-proof together.')
+                output = prepare_request(args.kind, args.task, args.workspace_id, args.language, args.iteration,
+                                         path.read_text(encoding='utf-8'), *flags)
+                print(json.dumps(output)); return 0
             print(message(args.kind, args.task, args.workspace_id, args.language, args.iteration, path.read_text(encoding="utf-8")), end="")
             return 0
         print(json.dumps(output, ensure_ascii=False, indent=2))
