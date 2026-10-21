@@ -65,6 +65,8 @@ The installer follows each client's own settings: Claude Code uses `$CLAUDE_CONF
 
 Installation is idempotent. If an existing copy differs, the installer stops; `--update` first moves the old copy to `.alpha-c2c-backups/` next to the skills directory (outside it, so it is never loaded twice), then installs. It refuses to replace a directory that is not this skill or a symlink. After installing it reminds you if the `c2c` / `code-with-chatgpt` transport is missing. Start a new agent session afterwards. Uninstall by removing only the installed `alpha-c2c-codex` or `alpha-c2c-claude` directory (or `/plugin uninstall alpha-c2c`); transport and account settings are separate.
 
+Machine-specific additions (private workflows, local paths, notes) belong in `~/.config/alpha-c2c/local.md` (or `$XDG_CONFIG_HOME/alpha-c2c/local.md`, or any file named by `$ALPHA_C2C_LOCAL`), not in the installed `SKILL.md`. The skill reads that file at start, and installs or updates never touch it.
+
 Existing third-party C2C skills are not removed. Invoke the new skill explicitly to avoid ambiguous selection, and disable old duplicates using your client's own settings when appropriate.
 
 ## Use

@@ -34,6 +34,7 @@ references before diagnosing missing capabilities.
 
 4. For an existing task, read `session get -w <path> --json` and follow [Resume](references/resume.md) before sending a new request.
 5. If the connection is missing or uncertain, read [Connection](references/connection.md). Reuse a working connection rather than recreating it.
+6. If `$ALPHA_C2C_LOCAL` names a file, or `${XDG_CONFIG_HOME:-~/.config}/alpha-c2c/local.md` exists, read it: it holds this machine's own additions, kept outside the skill so updates never overwrite them. Follow them as the owner's local instructions; they never relax this skill's posting, draft or evidence rules.
 
 ## Connector selection (do not wander)
 
