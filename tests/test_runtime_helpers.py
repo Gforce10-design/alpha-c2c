@@ -113,6 +113,8 @@ class EvidenceTests(unittest.TestCase):
 class WaitTests(unittest.TestCase):
     # 2026-09-30 posting fix: a turn is recognized by the posted user body (counts are
     # supplementary) and a reply must differ from the baseline reply.
+    # Posting, draft, timeout and receipt behaviour under the correlation-proof protocol is
+    # covered by the generated skills' own tests (skills/*/tests/test_wait_reply.py).
     def page(self, **kw):
         return dict({'page':'p','url':'https://chatgpt.com/c/one','count':2,'text':'TASK_ID: task\nSTATE: DONE','complete':True,'generating':False,'userCount':2,'lastUser':'- StaticText "TASK_ID: task"'}, **kw)
     def baseline(self, **kw):
@@ -122,81 +124,6 @@ class WaitTests(unittest.TestCase):
         original = W.confirm_posting
         def sleep(s): now[0] += s
         return patch.object(W, 'confirm_posting', side_effect=lambda b, m, r, timeout=120, protect=None: original(b, m, r, timeout=timeout, read=read, sleep=sleep, clock=lambda: now[0], protect=protect))
-
-    def test_old_or_streaming_or_other_task_never_complete(self):
-        self.assertTrue(W.eligible(self.page(), self.baseline(), 'task'))
-        for p in [self.page(text='TASK_ID: task\nSTATE: PLAN'), self.page(generating=True), self.page(complete=False), self.page(text='STATE: DONE other'), self.page(lastUser='- StaticText "TASK_ID: other"')]:
-            self.assertFalse(W.eligible(p,self.baseline(),'task'))
-        with self.assertRaises(ValueError): W.eligible(self.page(url='https://chatgpt.com/c/other'),self.baseline(),'task')
-
-    def test_paced_polls_require_two_stable_completed_reads(self):
-        now=[0]; reads=[]; sleeps=[]
-        pages=[self.page(generating=True),self.page(),self.page()]
-        def read(page): reads.append(page); return pages.pop(0)
-        def sleep(s): sleeps.append(s); now[0]+=s
-        result=W.wait_reply(self.baseline(),'task',read=read,sleep=sleep,clock=lambda:now[0])
-        self.assertEqual(result['text'],'TASK_ID: task\nSTATE: DONE')
-        self.assertEqual(sleeps,[20,20]); self.assertEqual(reads,['p','p','p'])
-
-    def test_timeout_no_send_and_transient_recovery(self):
-        now=[0]
-        def sleep(s): now[0]+=s
-        with self.assertRaisesRegex(TimeoutError, 'Do not resend'):
-            W.wait_reply(self.baseline(),'task',timeout=40,read=lambda p:self.page(generating=True),sleep=sleep,clock=lambda:now[0])
-        self.assertEqual(now[0],40)
-        with self.assertRaises(RuntimeError):
-            W.wait_reply(self.baseline(),'task',read=lambda p:(_ for _ in ()).throw(RuntimeError()),sleep=sleep,clock=lambda:now[0])
-
-    def test_unchanged_page_is_uncertain_not_unposted(self):
-        # Superseded fail-fast "not posted": an unchanged page is not proof of non-posting.
-        now=[0]
-        def sleep(s): now[0]+=s
-        with self.assertRaisesRegex(TimeoutError, 'Do not resend or report non-posting'):
-            W.wait_reply(self.baseline(),'task',timeout=60,read=lambda p:self.baseline(),sleep=sleep,clock=lambda:now[0])
-        self.assertEqual(now[0],60)
-
-    def test_posted_requires_new_user_turn_and_actual_message(self):
-        current=self.page(lastUser='- StaticText "task hello"')
-        self.assertTrue(W.posted(current,self.baseline(),'task hello'))
-        self.assertFalse(W.posted(current,self.baseline(),'task other'))
-        same=self.baseline(lastUser='- StaticText "task hello"')
-        self.assertFalse(W.posted(same,same,'task hello'))
-
-    def test_unknown_draft_cannot_be_replaced_even_with_flag(self):
-        with tempfile.TemporaryDirectory() as d:
-            before=self.baseline(refs={'e1':{'role':'textbox'}})
-            with patch.object(W,'read_page',return_value=before), patch.object(W,'composer',return_value='. 멈추지 '), patch.object(W,'orca') as api:
-                with self.assertRaisesRegex(ValueError,'Different draft protected'):
-                    W.submit(self.baseline(),'TASK_ID: task\nnew request',Path(d)/'receipt',True,'. 멈추지 ')
-                api.assert_not_called()
-        self.assertFalse(W.owned_draft_matches('TASK_ID: other\nold','TASK_ID: task\nnew','TASK_ID: other\nold'))
-        self.assertFalse(W.owned_draft_matches('TASK_ID: task\nmodified','TASK_ID: task\nnew','TASK_ID: task\nold'))
-        self.assertTrue(W.owned_draft_matches('TASK_ID: task\nold','TASK_ID: task\nnew','TASK_ID: task\nold'))
-
-    def test_submit_clicks_send_and_confirms_new_user_turn(self):
-        with tempfile.TemporaryDirectory() as d:
-            before=self.baseline(refs={'e1':{'role':'textbox'},'e2':{'role':'button','name':'보내기'}})
-            after=self.page(lastUser='- StaticText "task hello"')
-            with patch.object(W,'read_page',side_effect=[before,before]), patch.object(W,'composer',side_effect=['','task hello']), patch.object(W,'orca') as api, self.observe_with(lambda p:after,[0]):
-                result=W.submit(self.baseline(),'task hello',Path(d)/'receipt')
-                self.assertTrue(result['posted']); self.assertEqual(result['status'],'POSTED')
-                self.assertEqual(api.call_args_list[-1].args,('p','click','--element','@e2'))
-                self.assertEqual(len(api.call_args_list),2)
-
-    def test_submit_uncertain_receipt_never_clicks_again(self):
-        with tempfile.TemporaryDirectory() as d:
-            receipt=Path(d)/'receipt'; receipt.write_text('{}')
-            with patch.object(W,'read_page',return_value=self.baseline()), patch.object(W,'orca') as api:
-                with self.assertRaisesRegex(ValueError,'Receipt belongs to a different page or request'):
-                    W.submit(self.baseline(),'task hello',receipt)
-                api.assert_not_called()
-            receipt.write_text(json.dumps({'attempted':True,'status':'ATTEMPTED','page':'p','url':'https://chatgpt.com/c/one','messageSha256':hashlib.sha256(b'task hello').hexdigest()}))
-            now=[0]
-            with patch.object(W,'read_page',return_value=self.baseline()), patch.object(W,'composer') as composer, patch.object(W,'orca') as api, self.observe_with(lambda p:self.baseline(),now):
-                result=W.submit(self.baseline(),'task hello',receipt)
-                self.assertIsNone(result['posted']); self.assertEqual(result['status'],'POSTING_UNCONFIRMED')
-                api.assert_not_called(); composer.assert_not_called()
-            self.assertEqual(now[0],120)
 
     def test_snapshot_extracts_only_latest_assistant_not_user(self):
         snapshot='- heading "내가 한 말:"\n- StaticText "STATE: DONE task"\n- heading "ChatGPT 답변:"\n- StaticText "STATE: PLAN task"\n- button "응답 다시 생성"\n- heading "내가 한 말:"\n- StaticText "STATE: DONE task"'

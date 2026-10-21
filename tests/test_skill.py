@@ -29,6 +29,10 @@ class BehaviorTests(unittest.TestCase):
                     self.assertEqual(result["state"], expected)
                     self.assertFalse(result["ready"])
                     self.assertNotIn("连接", json.dumps(result, ensure_ascii=False))
+                    self.assertNotIn("token", json.dumps(result).lower())
+                    # The workspace name is shown only as the connector label the executor must attach.
+                    connector = result.pop("expectedConnector")
+                    self.assertTrue(connector.endswith(" · do-not-leak"))
                     self.assertNotIn("do-not-leak", json.dumps(result))
 
     def test_stopped_unknown_and_invalid_states(self):

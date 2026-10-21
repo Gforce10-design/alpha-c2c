@@ -16,7 +16,7 @@ USER = re.compile(r'^\s*- heading "(?:내가 한 말:|You said:)"[^\n]*$', re.M)
 MENTION = '[data-prompt-link-href^="app://"],[app-mention-name]'
 WITHOUT_MENTIONS = """const withoutMentions=e=>{
   const found=e.querySelectorAll?Array.from(e.querySelectorAll(%s)):[];
-  if(!found.length) return {text:e.innerText,mentions:[]};
+  if(!found.length&&e.isConnected) return {text:e.innerText,mentions:[]};
   const names=found.map(m=>m.getAttribute('app-mention-display-name')||m.innerText.trim());
   const copy=e.cloneNode(true); copy.querySelectorAll(%s).forEach(m=>m.remove());
   const host=document.createElement('div');
@@ -34,18 +34,89 @@ POSTED_USER_EXPRESSION = """JSON.stringify((()=>{
   const read=withoutMentions(e);
   return {body:read.text,mentions:read.mentions,id:owner?(owner.getAttribute('data-message-id')||owner.getAttribute('data-turn-id')):null};
 })())""" % WITHOUT_MENTIONS
+# Read authored posted units in document order, never the composer or tool payloads.
+POSTED_TURNS_EXPRESSION = r"""JSON.stringify((()=>{
+  %s
+  const latest=JSON.parse(eval(%s));
+  let roots=Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key][data-chatgpt-search-message-ids]'));
+  if(!roots.length) roots=Array.from(document.querySelectorAll('[data-message-author-role="user"],[data-message-author-role="assistant"]'));
+  const turns=roots.filter(e=>!e.closest('[role=textbox],form,[data-tool-call],[data-tool-result]')).map(e=>{
+    const key=e.getAttribute('data-chatgpt-search-unit-key')||'';
+    const role=e.getAttribute('data-message-author-role')||(key.endsWith(':user')?'user':key.endsWith(':assistant')?'assistant':null);
+    const ids=Array.from(new Set((e.getAttribute('data-chatgpt-search-message-ids')||e.getAttribute('data-message-id')||e.getAttribute('data-turn-id')||'').trim().split(/\s+/).filter(Boolean)));
+    const selector=role==='user'?'[data-markdown-text-tone="user-message"],.whitespace-pre-wrap':'[data-message-content],.markdown,.text-size-chat.whitespace-pre-wrap';
+    let contents=role==='assistant'?Array.from(e.querySelectorAll('.markdown,[class]')).filter(n=>
+      n.matches('.markdown')||Array.from(n.classList).some(token=>token.startsWith('MarkdownRoot-'))):[];
+    if(!contents.length) contents=Array.from(e.querySelectorAll(selector));
+    contents=contents.filter(n=>!n.closest||!n.closest('[data-tool-call],[data-tool-result],[data-message-author-role="tool"]'));
+    contents=contents.filter(n=>!contents.some(other=>other!==n&&other.contains(n)));
+    if(!contents.length){const one=e.querySelector(selector);if(one) contents=[one];}
+    if(!contents.length||!role) return null;
+    const reads=contents.map(content=>{
+      const copy=content.cloneNode(true);
+      copy.querySelectorAll('[data-tool-call],[data-tool-result],[data-message-author-role="tool"],button,h4[data-conversation-role]').forEach(n=>n.remove());
+      const read=withoutMentions(copy);
+      // Preserve visible body. Only real simple inline-code DOM nodes can
+      // supply their lost single-backtick markers for authored request matching.
+      const marked=role==='user'?copy.cloneNode(true):null;
+      const codes=marked?Array.from(marked.querySelectorAll('code')):[];
+      const supported=codes.length>0&&codes.length<=64&&codes.every(n=>
+        !n.closest('pre')&&n.children.length===0&&n.textContent.length>0&&!/[`\r\n]/.test(n.textContent));
+      let authored={};
+      if(supported){
+        codes.forEach(n=>n.replaceWith(document.createTextNode('`'+n.textContent+'`')));
+        authored={inlineCodeBodyVersion:'user-inline-code-single-backtick.v1',
+          inlineCodeMarkCount:codes.length,inlineCodeMarkedBody:withoutMentions(marked).text};
+      }
+      copy.querySelectorAll('blockquote,pre,code').forEach(n=>n.remove());
+      return {...read,...authored,protocol:withoutMentions(copy).text};
+    });
+    const read={text:reads.map(r=>r.text).join('\n'),mentions:reads.flatMap(r=>r.mentions)},state=e.closest('[data-talvt-turn-state]');
+    const complete=role==='assistant'&&(state?state.getAttribute('data-talvt-turn-state')==='complete':Array.from(e.querySelectorAll('button')).some(b=>['응답 다시 생성','Regenerate','Try again'].includes(b.getAttribute('aria-label')||b.innerText)));
+    return {role,body:read.text,...(role==='user'&&reads.length===1&&reads[0].inlineCodeBodyVersion?{
+      inlineCodeBodyVersion:reads[0].inlineCodeBodyVersion,inlineCodeMarkCount:reads[0].inlineCodeMarkCount,
+      inlineCodeMarkedBody:reads[0].inlineCodeMarkedBody}:{}),
+      protocolSegments:reads.map(r=>r.protocol),mentions:read.mentions,id:ids.length===1?ids[0]:null,ids,key,complete};
+  }).filter(Boolean);
+  return {...(latest||{}),turns};
+})())""" % (WITHOUT_MENTIONS,json.dumps(POSTED_USER_EXPRESSION))
+
 COMPOSER_EXPRESSION = """JSON.stringify((()=>{
   %s
-  return Array.from(document.querySelectorAll('[role=textbox][contenteditable=true],textarea'))
-    .map(e=>e.value===undefined?withoutMentions(e):{text:e.value,mentions:[]});
+  return Array.from(document.querySelectorAll('form [role=textbox][contenteditable=true],form textarea'))
+    .map(e=>({... (e.value===undefined?withoutMentions(e):{text:e.value,mentions:[]}),accessibleName:e.getAttribute('aria-label')||''}));
 })())""" % WITHOUT_MENTIONS
 # Put the caret before any connector chip so inserted text never replaces it.
 CARET_START_EXPRESSION = """(()=>{
-  const e=document.querySelector('[role=textbox][contenteditable=true]');
+  const e=document.querySelector('form [role=textbox][contenteditable=true]');
   const first=e&&e.querySelector('p'); if(!first) return 'no-composer';
   e.focus(); const r=document.createRange(); r.setStart(first,0); r.collapse(true);
   const s=getSelection(); s.removeAllRanges(); s.addRange(r); return 'caret-start';
 })()"""
+
+# Orca can return `clicked` for a disabled button without dispatching a click.
+# Accessibility refs omit disabled metadata; inspect the live composer form and
+# use its semantic selector, rather than assuming a tool acknowledgement sent it.
+SEND_READY_EXPRESSION = """JSON.stringify((()=>{
+  const boxes=Array.from(document.querySelectorAll('form [role=textbox][contenteditable=true],form textarea'));
+  if(boxes.length!==1) return {ready:false,reason:'composer-count'};
+  const form=boxes[0].closest('form');
+  if(!form) return {ready:false,reason:'composer-form-unavailable'};
+  const names=['보내기','Send','Send message'];
+  const buttons=Array.from(form.querySelectorAll('button')).filter(e=>names.includes(e.getAttribute('aria-label')));
+  if(buttons.length!==1) return {ready:false,reason:'send-button-count'};
+  const e=buttons[0],r=e.getBoundingClientRect();
+  if(e.disabled||e.matches(':disabled')||e.getAttribute('aria-disabled')==='true')
+    return {ready:false,reason:'send-disabled'};
+  const style=getComputedStyle(e);
+  if(r.width<=0||r.height<=0||style.visibility!=='visible'||style.display==='none'||style.pointerEvents==='none')
+    return {ready:false,reason:'send-hidden'};
+  const top=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+  if(!top||!(top===e||e.contains(top))) return {ready:false,reason:'send-obscured'};
+  const selector='form button[aria-label='+JSON.stringify(e.getAttribute('aria-label'))+']';
+  if(document.querySelectorAll(selector).length!==1) return {ready:false,reason:'send-selector-ambiguous'};
+  return {ready:true,selector};
+})())"""
 
 
 # Real keystrokes aimed at another app can land in an autofocused ChatGPT composer
@@ -61,7 +132,7 @@ GUARD_EXPRESSION = """JSON.stringify((()=>{
   }
   window.__c2cGuard=__ENABLED__;
   if(__ENABLED__&&document.activeElement&&document.activeElement.blur) document.activeElement.blur();
-  const boxes=Array.from(document.querySelectorAll('[role=textbox][contenteditable=true],textarea'));
+  const boxes=Array.from(document.querySelectorAll('form [role=textbox][contenteditable=true],form textarea'));
   return {guarded:window.__c2cGuard,url:location.href,drafts:boxes.map(e=>e.value===undefined?e.innerText:e.value)};
 })())""" % json.dumps(GUARD_EVENTS)
 
@@ -73,9 +144,10 @@ class TransientEmptyPage(RuntimeError):
 class ComposerText(str):
     """Composer text without connector chips; the chip names ride along."""
 
-    def __new__(cls, text, mentions=()):
+    def __new__(cls, text, mentions=(), accessible_name=None):
         value = super().__new__(cls, text)
         value.mentions = list(mentions)
+        value.accessible_name = accessible_name
         return value
 
 
@@ -151,24 +223,37 @@ def read_page(page):
     labels = [v.get('name', '') for v in result.get('refs', {}).values() if v.get('role') == 'button']
     generating = any(x in ('중지', 'Stop', 'Stop generating', '생성 중지') for x in labels)
     complete = bool(re.search(r'button "(?:응답 다시 생성|Regenerate|Try again)"', latest))
-    user_body, user_id = None, None
-    if users:
+    user_body, user_id, turns = None, None, None
+    if snapshot.strip() not in ('', '(empty page)') or result.get('refs'):
         # Accessibility snapshots can omit inert link labels and include turn controls.
-        dom = orca(page, 'eval', '--expression', POSTED_USER_EXPRESSION)
+        dom = orca(page, 'eval', '--expression', POSTED_TURNS_EXPRESSION)
         if dom.get('origin') != result['origin']:
             raise RuntimeError('Page changed during snapshot/DOM read; observe again without sending.')
         user = json.loads(dom['result'])
         if user is not None:
-            user_body, user_id = user['body'], user.get('id')
-            for key in ('TASK_ID', 'WORKSPACE_ID', 'ITERATION'):
+            user_body, user_id = user.get('body'), user.get('id')
+            turns = user.get('turns')
+            if user_body is None and turns:
+                latest_user = next((t for t in reversed(turns) if t['role'] == 'user'), None)
+                if latest_user:
+                    user_body, user_id = latest_user['body'], latest_user.get('id')
+            for key in ('TASK_ID', 'WORKSPACE_ID', 'ITERATION', 'REQUEST_ID'):
                 pattern = r'\b' + key + r':\s*([A-Za-z0-9_.:-]+)'
                 ax = re.search(pattern, visible_text(last_user))
-                body = re.search(pattern, user_body)
+                body = re.search(pattern, user_body or '')
                 if ax and (not body or ax.group(1) != body.group(1)):
                     raise RuntimeError('Latest user DOM/snapshot identity mismatch; observe again without sending.')
+    if turns:
+        dom_reply = next((t for t in reversed(turns) if t['role'] == 'assistant'), None)
+        if dom_reply and latest:
+            for key in ('TASK_ID', 'ITERATION', 'WORKSPACE_ID', 'REQUEST_ID'):
+                ax_values, dom_values = marker_values(visible_text(latest), key), marker_values(dom_reply['body'], key)
+                if ax_values and ax_values != dom_values:
+                    raise RuntimeError('Assistant DOM/snapshot identity mismatch; observe again without sending')
     return {'page': page, 'url': result['origin'], 'count': len(matches), 'text': latest,
             'userCount': len(users), 'lastUser': last_user, 'refs': result.get('refs', {}),
             'userBody': user_body, 'userMessageId': user_id,
+            **({'postedTurns': turns} if turns is not None else {}),
             'emptyDocument': snapshot.strip() in ('', '(empty page)'),
             'generating': generating, 'complete': complete}
 
@@ -232,40 +317,323 @@ def new_user_turn(current, baseline):
     return bool(body) and (changed or current.get('userCount', 0) > baseline.get('userCount', 0))
 
 
-def eligible(current, baseline, task, message=None):
+def matching_posted_body(turn, message):
+    """Exact existing comparison, or markers reconstructed from qualified DOM.
+
+    Never remove backticks from requests, drafts, arbitrary text or code blocks.
+    Raw visible body remains available separately from authored reconstruction.
+    """
+    body = turn.get('body', '')
+    if normalized(body) == normalized(message):
+        return body, 'visible-body'
+    count = turn.get('inlineCodeMarkCount')
+    marked = turn.get('inlineCodeMarkedBody')
+    if (turn.get('role') == 'user' and
+            turn.get('inlineCodeBodyVersion') == 'user-inline-code-single-backtick.v1' and
+            type(count) is int and 1 <= count <= 64 and isinstance(marked, str) and
+            normalized(marked) == normalized(message)):
+        return marked, 'dom-single-backtick-inline-code'
+    return None
+
+
+def rendered_request(current, message):
+    """Unique authored request, independent of whether it predates capture."""
+    turns = current.get('postedTurns')
+    if turns is None:
+        return current if normalized(user_body(current)) == normalized(message) else None
+    matches = [i for i, t in enumerate(turns) if t.get('role') == 'user'
+               and matching_posted_body(t, message) is not None]
+    # An ambiguous body/ID must inhibit input, not silently fall back to latest AX.
+    ids = [i for t in turns for i in t.get('ids', [t.get('id')]) if i]
+    if len(matches) > 1 or len(ids) != len(set(ids)):
+        raise ValueError('Ambiguous posted request or reused message identity; observe without sending')
+    if not matches:
+        # Even unsupported/empty whole-turn extraction cannot authorize duplicate input.
+        if (normalized(user_body(current)) == normalized(message)
+                or normalized(accessibility_user_body(current)) == normalized(message)):
+            return {**current, 'unsupportedPostedStructure': True}
+        return None
+    index = matches[0]
+    request = turns[index]
+    following = []
+    for turn in turns[index + 1:]:
+        if turn.get('role') == 'user':
+            break
+        if turn.get('role') == 'assistant':
+            following.append(turn)
+    reply = following[0] if len(following) == 1 else None
+    authored, body_mode = matching_posted_body(request, message)
+    return {**current, 'userBody': authored, 'visibleUserBody': request['body'],
+            'postedBodyMode': body_mode, 'userMessageId': request.get('id'),
+            'lastUser': request['body'], 'text': reply['body'] if reply else '',
+            'responseMessageId': reply.get('id') if reply else None,
+            'protocolSegments': reply.get('protocolSegments') if reply else None,
+            'complete': bool(reply and reply.get('complete')),
+            'associatedDOM': True, 'rawResponseSnapshot': current['text'],
+            'selectedRequestIndex': index}
+
+
+def canonical_sha(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                     separators=(',', ':')).encode()).hexdigest()
+
+
+def validated_generation(baseline, message, proof=None, attempt=None):
+    """Descriptive preparation correlation, not permission or server attestation."""
+    archived = attempt.get('generationProof') if attempt else None
+    if attempt is not None and proof is not None and archived is None:
+        raise ValueError('Existing receipt has no original generation proof; retrospective proof graft refused')
+    supplied = json.loads(proof.read_text()) if isinstance(proof, Path) else proof
+    if archived is not None:
+        if attempt.get('generationProofSha256') != canonical_sha(archived):
+            raise ValueError('Archived generation proof hash mismatch')
+        if supplied is not None and supplied != archived:
+            raise ValueError('Generation proof differs from original attempted request')
+        supplied = archived
+    if supplied is None:
+        return None
+    producer = Path(__file__).with_name('c2c.py')
+    expected = protocol_header(message)
+    identity = {key: next(iter(expected[key])) for key in ('TASK_ID','WORKSPACE_ID','ITERATION','REQUEST_ID')
+                if key in expected and len(expected[key]) == 1}
+    nonce = identity.get('REQUEST_ID', '')
+    if (not isinstance(supplied, dict) or supplied.get('schema') != 'c2c-prepared-request-v1'
+            or supplied.get('status') != 'prepared'
+            or supplied.get('producer') != '__SKILL_NAME__/scripts/c2c.py'
+            or supplied.get('producerSha256') != hashlib.sha256(producer.read_bytes()).hexdigest()
+            or supplied.get('messageSha256') != hashlib.sha256(message.encode()).hexdigest()
+            or supplied.get('baselineSha256') != canonical_sha(baseline)
+            or supplied.get('page') != baseline['page'] or supplied.get('url') != baseline['url']
+            or len(identity) != 4 or supplied.get('identity') != identity
+            or not re.fullmatch(r'request-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', nonce)):
+        raise ValueError('Request preparation correlation binding failed; retain files without sending')
+    return supplied
+
+
+def protocol_header(text, *, occurrences=None):
+    """Only the leading authored metadata block, never examples in the body."""
+    text = text.lstrip()
+    # Rendered markdown normally loses these wrappers; legacy AX can retain them.
+    text = re.sub(r'^(?:#{1,6}\s+)?(?:Metadata|메타데이터)\s*[:：]?\s*\n', '', text, flags=re.I)
+    text = text.replace('**', '')
+    text = re.sub(r'^#{1,6}\s+(?=TASK_ID:)', '', text)
+    values = {}
+    token = re.compile(r'(TASK_ID|WORKSPACE_ID|ITERATION|PHASE|REQUEST_ID|STATE):\s*([A-Za-z0-9_.:-]+)')
+    position = 0
+    separator_seen = False
+    while True:
+        match = token.match(text, position)
+        if not match:
+            # A single standalone C2C label may separate the complete identity
+            # from its immediately following state. Never search the body for
+            # a state or accept a label before the four identities are bound.
+            identities = ('TASK_ID', 'WORKSPACE_ID', 'ITERATION', 'REQUEST_ID')
+            if (not separator_seen and 'STATE' not in values and
+                    all(len(values.get(key, set())) == 1 for key in identities)):
+                separator = re.match(r'\[C2C\][ \t]*\r?\n\s*(?=STATE:)', text[position:])
+                if separator:
+                    separator_seen = True
+                    position += separator.end()
+                    continue
+            break
+        if occurrences is not None:
+            occurrences[match[1]] = occurrences.get(match[1], 0) + 1
+        values.setdefault(match[1], set()).add(match[2])
+        position = match.end()
+        while position < len(text) and text[position].isspace():
+            position += 1
+    return values
+
+
+def marker_values(text, key):
+    return protocol_header(text).get(key, set())
+
+
+def reply_identity_matches(protocol, message, strict=False):
+    for key in ('TASK_ID', 'ITERATION', 'WORKSPACE_ID', 'REQUEST_ID'):
+        expected = marker_values(message, key)
+        actual = marker_values(protocol, key)
+        if len(expected) > 1 or len(actual) > 1:
+            return False
+        if expected and actual and expected != actual:
+            return False
+        if strict and expected and not actual:
+            return False
+    return True
+
+
+def protocol_response(current):
+    segments = current.get('protocolSegments')
+    if segments is None:
+        segments = [visible_text(current['text'])]
+    headers = []
+    for segment in segments:
+        occurrences = {}
+        header = protocol_header(segment, occurrences=occurrences)
+        if header:
+            headers.append((header, occurrences))
+    if len(headers) != 1:
+        return ''
+    header, occurrences = headers[0]
+    if any(count != 1 for count in occurrences.values()) or any(len(values) != 1 for values in header.values()):
+        return ''
+    return ' '.join(key + ': ' + next(iter(values)) for key, values in header.items())
+
+
+def associated_observation(current, baseline, message, pinned_user_id=None, generation=None):
+    if generation is None or message is None:
+        return None
+    selected = rendered_request(current, message)
+    if (selected and selected.get('associatedDOM') and selected.get('userMessageId')
+            and not selected.get('unsupportedPostedStructure')
+            and (not pinned_user_id or selected.get('userMessageId') == pinned_user_id)):
+        return selected
+    return None
+
+
+def eligible(current, baseline, task, message=None, pinned_user_id=None, request_proof=None):
     check_identity(current, baseline)
+    generation = validated_generation(baseline, message, request_proof) if message is not None else None
+    if generation is None:
+        return False
+    if message is not None:
+        selected = associated_observation(current, baseline, message, pinned_user_id, generation)
+        if selected is None:
+            return False
+        current = selected
     user = user_body(current)
     reply = visible_text(current['text'])
-    request_matches = posted(current, baseline, message) if message is not None else (
+    protocol = protocol_response(current) if current.get('associatedDOM') else reply
+    if current.get('associatedDOM') and not current.get('responseMessageId'):
+        return False
+    request_matches = associated_observation(current, baseline, message, pinned_user_id, generation) is not None if message is not None else (
         new_user_turn(current, baseline) and has_task(user, task))
     return (request_matches and not current['generating'] and current['complete']
             and response_body(current['text']) != response_body(baseline['text'])
-            and has_task(reply, task)
-            and bool(re.search(r'\bSTATE:\s*(?:PLAN|DONE|BLOCKED)\b', reply)))
+            and has_task(protocol, task)
+            and (message is None or reply_identity_matches(protocol, message, current.get('associatedDOM', False)))
+            and (len(marker_values(protocol, 'STATE')) == 1 and bool(marker_values(protocol, 'STATE') & {'PLAN', 'REVISE', 'DONE', 'BLOCKED'})
+                 if current.get('associatedDOM') else bool(re.search(r'\bSTATE:\s*(?:PLAN|REVISE|DONE|BLOCKED)\b', reply))))
 
 
-def wait_reply(baseline, task, timeout=600, interval=20, read=read_page, sleep=time.sleep, clock=time.monotonic, message=None, protect=None):
+def completed_protocol_identity(selected, message, pinned_user_id):
+    """Only complete, pinned, uniquely associated canonical authored headers."""
+    if (not selected or not pinned_user_id or not selected.get('associatedDOM')
+            or selected.get('userMessageId') != pinned_user_id
+            or not selected.get('responseMessageId') or selected.get('generating') is not False
+            or selected.get('complete') is not True):
+        return None
+    expected = protocol_header(message)
+    # Count raw authored tokens before set normalization can hide duplicates.
+    segments = selected.get('protocolSegments')
+    if segments is None:
+        segments = [visible_text(selected['text'])]
+    headers = []
+    for segment in segments:
+        occurrences = {}
+        header = protocol_header(segment, occurrences=occurrences)
+        if header:
+            headers.append((header, occurrences))
+    keys = ('TASK_ID', 'WORKSPACE_ID', 'ITERATION', 'REQUEST_ID')
+    if (len(headers) != 1 or
+            any(headers[0][1].get(key, 0) != 1 for key in (*keys, 'STATE'))):
+        return None
+    actual = headers[0][0]
+    if (any(len(expected.get(key, set())) != 1 or len(actual.get(key, set())) != 1 for key in keys)
+            or len(actual.get('STATE', set())) != 1):
+        return None
+    return ({key: next(iter(expected[key])) for key in keys},
+            {key: next(iter(actual[key])) for key in keys}, next(iter(actual['STATE'])))
+
+
+def explicit_reply_mismatch(selected, message, pinned_user_id):
+    """An explicit canonical identity conflict is a refusal, regardless of STATE."""
+    identity = completed_protocol_identity(selected, message, pinned_user_id)
+    if identity is None:
+        return None
+    wanted, observed, state = identity
+    conflicts = {key: {'expected': wanted[key], 'observed': observed[key]}
+                 for key in wanted if wanted[key] != observed[key]}
+    if not conflicts:
+        return None
+    return {'expectedIdentity': wanted, 'observedIdentity': observed, 'conflicts': conflicts}
+
+
+def explicit_reply_invalid_state(selected, message, pinned_user_id):
+    """Exact identities and a stable completed invalid review STATE are refused."""
+    identity = completed_protocol_identity(selected, message, pinned_user_id)
+    if identity is None:
+        return None
+    wanted, observed, state = identity
+    allowed = ('PLAN', 'REVISE', 'DONE', 'BLOCKED')
+    if wanted != observed or state in allowed:
+        return None
+    return {'expectedIdentity': wanted, 'observedIdentity': observed,
+            'observedState': state, 'allowedStates': list(allowed)}
+
+
+def wait_reply(baseline, task, timeout=600, interval=20, read=read_page, sleep=time.sleep, clock=time.monotonic, message=None, protect=None, receipt=None, request_proof=None):
+    pinned_user_id = None
+    attempt = None
+    if receipt is not None:
+        attempt = json.loads(receipt.read_text())
+        if message is None or attempt.get('page') != baseline['page'] or attempt.get('messageSha256') != hashlib.sha256(message.encode()).hexdigest():
+            raise ValueError('Receipt belongs to a different page or request')
+        check_identity({**baseline, 'url': attempt.get('url', baseline['url'])}, baseline)
+        if attempt.get('posted') is True:
+            pinned_user_id = attempt.get('userMessageId')
+    generation = validated_generation(baseline, message, request_proof, attempt) if message is not None else None
+    if generation is None:
+        raise ValueError('Reply admission HOLD: no original qualified request preparation correlation')
     deadline = clock() + timeout
     last = None
+    last_mismatch = None
     errors = 0
-    identity = baseline
+    identity = {**baseline, 'url': attempt.get('url', baseline['url'])} if receipt is not None else baseline
     while clock() < deadline:
         if protect:
             protect(baseline['page'])
         try:
             current = read(baseline['page'])
-            check_identity(current, identity)
+            try:
+                check_identity(current, identity)
+            except ValueError:
+                last = None
+                last_mismatch = None
+                raise  # Preserve the existing fail-closed identity-drift contract.
             if '/c/' not in identity['url'] and '/c/' in current['url']:
                 identity = current  # Pin the first acquired conversation for subsequent reads.
             errors = 0
-            digest = hashlib.sha256(response_body(current['text']).encode()).hexdigest() if eligible(current, baseline, task, message) else None
+            selected = associated_observation(current, baseline, message, pinned_user_id, generation) if message is not None else None
+            stable = {'page': current['page'], 'url': current['url'],
+                      'userId': selected.get('userMessageId'), 'replyId': selected.get('responseMessageId'),
+                      'user': user_body(selected), 'reply': response_body(selected['text']),
+                      'complete': selected['complete']} if selected else None
+            digest = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest() if selected and eligible(current, baseline, task, message, pinned_user_id, generation) else None
             if digest is not None and digest == last:
-                return current
+                return selected
             last = digest
+            mismatch = explicit_reply_mismatch(selected, message, pinned_user_id)
+            refusal = mismatch or explicit_reply_invalid_state(selected, message, pinned_user_id)
+            refusal_type = 'reply_mismatch' if mismatch else 'reply_invalid_state'
+            negative = {**stable, 'user': user_body(selected), 'reply': selected['text'],
+                        'refusalType': refusal_type, 'explicitRefusal': refusal} if refusal else None
+            negative_digest = canonical_sha(negative) if negative else None
+            if negative_digest is not None and negative_digest == last_mismatch:
+                return {'type': refusal_type, 'ok': False, 'complete': False,
+                        'page': selected['page'], 'url': selected['url'], 'count': selected['count'],
+                        **refusal, 'rejectedResponse': selected,
+                        'generationProof': generation, 'generationProofSha256': canonical_sha(generation),
+                        'reason': ('Stable completed associated reply has conflicting canonical protocol IDs'
+                                   if mismatch else 'Stable completed associated reply has an invalid review STATE'),
+                        'stableObservations': 2, 'pollIntervalSeconds': interval}
+            last_mismatch = negative_digest
         except TransientEmptyPage:
             last = None  # A blank observation cannot count toward two stable reads.
+            last_mismatch = None
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError):
             last = None
+            last_mismatch = None
             errors += 1
             if errors >= 3:
                 raise RuntimeError('Three snapshot failures; inspect this page without resending.')
@@ -277,19 +645,19 @@ def normalized(text):
     return ' '.join(text.split())
 
 
-def posted(current, baseline, message):
+def posted(current, baseline, message, request_proof=None):
     check_identity(current, baseline)
-    body = user_body(current)
-    return new_user_turn(current, baseline) and normalized(message) == normalized(body)
+    return associated_observation(current, baseline, message, generation=validated_generation(baseline, message, request_proof)) is not None
 
 
 def confirm_posting(baseline, message, receipt, timeout=120, interval=20,
-                    read=read_page, sleep=time.sleep, clock=time.monotonic, protect=None):
+                    read=read_page, sleep=time.sleep, clock=time.monotonic, protect=None, request_proof=None):
     """Observe a prior send only; a timeout is uncertainty, never permission to resend."""
     attempt = json.loads(receipt.read_text())
     digest = hashlib.sha256(message.encode()).hexdigest()
     if attempt.get('page') != baseline['page'] or attempt.get('messageSha256') != digest:
         raise ValueError('Receipt belongs to a different page or request')
+    generation = validated_generation(baseline, message, request_proof, attempt)
     deadline = clock() + timeout
     identity = {**baseline, 'url': attempt.get('url', baseline['url'])}
     check_identity(identity, baseline)
@@ -303,9 +671,17 @@ def confirm_posting(baseline, message, receipt, timeout=120, interval=20,
             if '/c/' not in identity['url'] and '/c/' in current['url']:
                 identity = current
             errors = 0
-            if posted(current, baseline, message):
+            selected = rendered_request(current, message)
+            pinned = (generation is not None and attempt.get('posted') is True and attempt.get('userMessageId')
+                      and selected and selected.get('userMessageId') == attempt['userMessageId'])
+            confirmed = attempt.get('posted') is True
+            attempt['lastObservation'] = ('REQUEST_ID_DRIFT' if confirmed and selected and attempt.get('userMessageId') and selected.get('userMessageId') != attempt['userMessageId']
+                                          else 'REQUEST_NOT_RENDERED' if not selected else 'REQUEST_RENDERED')
+            if pinned or (not confirmed and posted(current, baseline, message, generation)):
                 result = {**attempt, 'posted': True, 'status': 'POSTED',
-                          'page': current['page'], 'url': current['url'], 'nextAction': 'wait_same_baseline'}
+                          'page': current['page'], 'url': current['url'],
+                          'userMessageId': rendered_request(current, message).get('userMessageId'),
+                          'nextAction': 'wait_same_baseline'}
                 receipt.write_text(json.dumps(result, ensure_ascii=False) + '\n')
                 return result
         except TransientEmptyPage:
@@ -315,8 +691,11 @@ def confirm_posting(baseline, message, receipt, timeout=120, interval=20,
             if errors >= 3:
                 raise RuntimeError('Three snapshot failures; retain the attempt receipt and reconcile without sending.')
         if clock() >= deadline:
-            result = {**attempt, 'posted': None, 'status': 'POSTING_UNCONFIRMED',
-                      'url': identity['url'], 'nextAction': 'reconcile_same_page_no_resend'}
+            result = {**attempt, 'posted': True if attempt.get('posted') is True else None,
+                      'status': 'POSTED' if attempt.get('posted') is True else 'POSTING_UNCONFIRMED',
+                      'lastObservation': attempt.get('lastObservation', 'REQUEST_NOT_CONFIRMED_IN_CURRENT_RENDER'),
+                      'url': identity['url'], 'replyAdmission': 'QUALIFIED' if generation else 'HOLD_UNQUALIFIED_LEGACY',
+                      'nextAction': 'reconcile_same_page_no_resend'}
             receipt.write_text(json.dumps(result, ensure_ascii=False) + '\n')
             return result
         sleep(min(interval, max(0, deadline - clock())))
@@ -327,50 +706,190 @@ def composer(page):
     values = json.loads(result['result'])
     if len(values) != 1:
         raise ValueError('Expected one composer on the owned page')
-    return ComposerText(values[0]['text'], values[0].get('mentions', []))
+    return ComposerText(values[0]['text'], values[0].get('mentions', []), values[0].get('accessibleName'))
 
 
 def owned_draft_matches(draft, message, known_draft):
-    ids = lambda text: re.findall(r'^TASK_ID:\s*([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\s*$', text, re.M)
-    return (known_draft is not None and normalized(draft) == normalized(known_draft)
-            and len(ids(draft)) == 1 and ids(draft) == ids(message))
+    """Exact editor serialization: one trailing separator only for one chip."""
+    chips = list(getattr(draft, 'mentions', []))
+    same_bytes = known_draft is not None and (str(draft) == known_draft or
+        (len(chips) == 1 and str(draft) == known_draft + ' '))
+    before, after = protocol_header(str(draft)).get('TASK_ID', set()), protocol_header(message).get('TASK_ID', set())
+    return same_bytes and len(before) == 1 and before == after
 
 
-def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=None, posting_timeout=120, protect=None):
+def native_focus_editor(page, box):
+    """Fresh editable viewport hit; no blind coordinates or control target."""
+    hit_expression = """JSON.stringify((()=>{
+      const boxes=Array.from(document.querySelectorAll('form [role=textbox][contenteditable=true]'));
+      if(boxes.length!==1)return {ok:false};
+      const e=boxes[0],r=e.getBoundingClientRect();
+      const left=Math.max(0,r.left),right=Math.min(innerWidth,r.right),top=Math.max(0,r.top),bottom=Math.min(innerHeight,r.bottom);
+      if(right<=left||bottom<=top)return {ok:false};
+      for(const fy of [0.8,0.5,0.2])for(const fx of [0.1,0.5,0.9]){
+        const x=left+(right-left)*fx,y=top+(bottom-top)*fy,t=document.elementFromPoint(x,y);
+        if(t&&(t===e||e.contains(t))&&t.isContentEditable&&!t.closest('[contenteditable=false],a,button'))return {ok:true,x,y};
+      }
+      return {ok:false};
+    })())"""
+    hit = json.loads(orca(page, 'eval', '--expression', hit_expression)['result'])
+    if not hit.get('ok'):
+        raise ValueError('Owned editable hit target unavailable; not sent')
+    orca(page, 'mouse', 'move', '--x', str(hit['x']), '--y', str(hit['y']))
+    orca(page, 'mouse', 'down', '--button', 'left')
+    orca(page, 'mouse', 'up', '--button', 'left')
+    orca(page, 'focus', '--element', '@' + box)
+
+
+def insert_native_lines(page, message):
+    """Preserve original LF separators through native input, never flatten."""
+    for index, line in enumerate(message.split('\n')):
+        if index:
+            orca(page, 'keypress', '--key', 'Shift+Enter')
+        if line:
+            orca(page, 'inserttext', '--text', line)
+
+
+def insert_empty_chip_draft(baseline, message, chips, box):
+    """The empty editor is rechecked around native focus before insertion."""
+    page = baseline['page']
+    current = read_page(page)
+    check_identity(current, baseline)
+    draft = composer(page)
+    if normalized(draft) or list(draft.mentions) != chips:
+        raise ProtectedDraft('Empty composer or connector changed before focus; retained', draft)
+    native_focus_editor(page, box)
+    current = read_page(page)
+    check_identity(current, baseline)
+    draft = composer(page)
+    if normalized(draft) or list(draft.mentions) != chips:
+        raise ProtectedDraft('Empty composer or connector changed after focus; retained', draft)
+    if orca(page, 'eval', '--expression', CARET_START_EXPRESSION).get('result') != 'caret-start':
+        raise ValueError('Composer caret unavailable; not sent')
+    insert_native_lines(page, message)
+
+
+def replace_owned_chip_draft(baseline, message, known_draft, chips, box):
+    """Native text replacement; never delete nodes, chip, or dispatch Send."""
+    page = baseline['page']
+    current = read_page(page)
+    check_identity(current, baseline)
+    draft = composer(page)
+    if not owned_draft_matches(draft, message, known_draft) or list(draft.mentions) != chips:
+        raise ProtectedDraft('Owned draft changed before native focus; retained', draft)
+    native_focus_editor(page, box)
+    current = read_page(page)
+    check_identity(current, baseline)
+    draft = composer(page)
+    if not owned_draft_matches(draft, message, known_draft) or list(draft.mentions) != chips:
+        raise ProtectedDraft('Owned draft changed after native focus; retained', draft)
+    selection_expression = """JSON.stringify((()=>{
+      %s
+      const boxes=Array.from(document.querySelectorAll('form [role=textbox][contenteditable=true]'));
+      if(boxes.length!==1)return {ok:false,reason:'composer-count'};
+      const e=boxes[0], chips=Array.from(e.querySelectorAll(%s)),read=withoutMentions(e);
+      const expected=%s,names=%s;
+      if(chips.length!==1||JSON.stringify(read.mentions)!==JSON.stringify(names))return {ok:false,reason:'chip-identity'};
+      if(read.text!==expected&&read.text!==expected+' ')return {ok:false,reason:'owned-text-mismatch'};
+      if(chips[0].getAttribute('contenteditable')!=='false')return {ok:false,reason:'chip-editability'};
+      const r=document.createRange();r.setStart(e,0);r.setEndBefore(chips[0]);
+      if(r.cloneContents().querySelector('[contenteditable=false]')||r.toString()!==expected)return {ok:false,reason:'unsafe-range'};
+      const selected=getSelection();selected.removeAllRanges();selected.addRange(r);
+      if(selected.rangeCount!==1||selected.getRangeAt(0).toString()!==expected)return {ok:false,reason:'selection-drift'};
+      return {ok:true,reason:'owned-text-selected'};
+    })())""" % (WITHOUT_MENTIONS, json.dumps(MENTION), json.dumps(known_draft), json.dumps(chips))
+    selection = json.loads(orca(page, 'eval', '--expression', selection_expression)['result'])
+    if not selection.get('ok'):
+        raise ValueError('Owned text selection unavailable: ' + selection.get('reason', 'unknown') + '; not sent')
+    insert_native_lines(page, message)
+
+
+def wait_send_ready(baseline, identity, message, chips, timeout=15, interval=0.5,
+                    read=None, clock=time.monotonic, sleep=time.sleep):
+    """Wait before the first attempt only; preserve the exact draft on failure."""
+    deadline = clock() + timeout
+    read = read or read_page
+    captured_layout = False
+    while True:
+        current = read(baseline['page'])
+        check_identity(current, identity)
+        if rendered_request(current, message) or new_user_turn(current, baseline) or current['generating']:
+            raise ValueError('Posted request appeared or page changed while preparing send; not sent')
+        draft = composer(baseline['page'])
+        if normalized(draft) != normalized(message) or list(getattr(draft, 'mentions', [])) != chips:
+            raise ValueError('Composer or connector changed while preparing send; not sent')
+        state = json.loads(orca(baseline['page'], 'eval', '--expression', SEND_READY_EXPRESSION)['result'])
+        if state.get('ready') is True:
+            selector = state.get('selector')
+            if selector not in ['form button[aria-label=' + json.dumps(name, ensure_ascii=False) + ']'
+                                for name in ('보내기', 'Send', 'Send message')]:
+                raise ValueError('Unexpected send selector; not sent')
+            return current, selector
+        if clock() >= deadline:
+            raise ValueError('Send button not ready (%s); draft retained, no click attempted' % state.get('reason', 'unknown'))
+        if state.get('reason') == 'send-obscured' and not captured_layout:
+            # Background WebContents can retain pre-animation geometry. Orca's
+            # native capture paints the owned page; discard the image and
+            # recheck the draft, conversation and hit target before any click.
+            orca(baseline['page'], 'screenshot')
+            captured_layout = True
+        sleep(min(interval, max(0, deadline - clock())))
+
+
+def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=None, posting_timeout=120, protect=None, request_proof=None):
     page = baseline['page']
     if receipt.exists():
-        return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect)
+        return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect, request_proof=request_proof)
+    generation = validated_generation(baseline, message, request_proof)
     current = read_page(page)
-    if posted(current, baseline, message):
+    if posted(current, baseline, message, generation):
         if receipt.exists():
             return confirm_posting(baseline, message, receipt, timeout=0)
         result = {'posted': True, 'status': 'POSTED', 'alreadyPosted': True, 'attempted': False,
                   'page': page, 'url': current['url'], 'nextAction': 'wait_same_baseline',
-                  'messageSha256': hashlib.sha256(message.encode()).hexdigest()}
+                  'messageSha256': hashlib.sha256(message.encode()).hexdigest(),
+                  'userMessageId': rendered_request(current, message).get('userMessageId'),
+                  'generationProof': generation, 'generationProofSha256': canonical_sha(generation)}
         receipt.write_text(json.dumps(result, ensure_ascii=False) + '\n')
         return result
     if receipt.exists():
-        return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect)
+        return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect, request_proof=request_proof)
+    if rendered_request(current, message):
+        result = {'posted': None, 'status': 'POSTING_UNCONFIRMED', 'alreadyPresent': True,
+                  'attempted': False, 'page': page, 'url': current['url'],
+                  'messageSha256': hashlib.sha256(message.encode()).hexdigest(),
+                  'nextAction': 'reconcile_same_page_no_resend'}
+        if generation is not None:
+            result.update(generationProof=generation, generationProofSha256=canonical_sha(generation))
+        receipt.write_text(json.dumps(result, ensure_ascii=False) + '\n')
+        return result
+    if generation is None:
+        raise ValueError('Submit HOLD: prepare a new request with its original correlation proof; not sent')
     if new_user_turn(current, baseline) or current['generating']:
         raise ValueError('Page changed since capture; reconcile before sending')
+    check_identity(current, baseline)  # Before any editor mutation or focus.
     identity = current if '/c/' in current['url'] else baseline
     draft = composer(page)
     if normalized(draft) and normalized(draft) != normalized(message):
         if not replace_owned_draft or not owned_draft_matches(draft, message, known_draft):
             raise ProtectedDraft('Different draft protected: replacement requires a matching previously saved draft file with the same TASK_ID. Tab inactivity is not ownership.', draft)
     boxes = [ref for ref, meta in current['refs'].items() if meta.get('role') == 'textbox']
+    # Every AX ref must match the unique live form editor, including a single ref.
+    name = getattr(draft, 'accessible_name', None)
+    boxes = [ref for ref in boxes if isinstance(name, str) and name and current['refs'][ref].get('name') == name]
     if len(boxes) != 1:
         raise ValueError('Expected one accessible composer')
     chips = list(getattr(draft, 'mentions', []))
-    if chips and normalized(draft):
-        raise ValueError('Replacing a draft next to a connector chip is unsupported; not sent')
-    if protect:
+    prepared = normalized(draft) == normalized(message)
+    owned_chip_replacement = bool(chips and normalized(draft) and not prepared)
+    if protect and not prepared:
         guard_input(page, enabled=False)  # Only after the draft check; readback catches stray keys.
-    if chips:
-        # fill would wipe the chip that attaches the connector; insert before it instead.
-        if orca(page, 'eval', '--expression', CARET_START_EXPRESSION).get('result') != 'caret-start':
-            raise ValueError('Composer caret unavailable; not sent')
-        orca(page, 'inserttext', '--text', message)
+    if prepared:
+        pass  # Preserve the already verified request; refilling restarts layout animations.
+    elif owned_chip_replacement:
+        replace_owned_chip_draft(baseline, message, known_draft, chips, boxes[0])
+    elif chips:
+        insert_empty_chip_draft(baseline, message, chips, boxes[0])
     else:
         orca(page, 'fill', '--element', '@' + boxes[0], '--value', message)
     written = composer(page)
@@ -378,17 +897,15 @@ def submit(baseline, message, receipt, replace_owned_draft=False, known_draft=No
         raise ValueError('Composer readback differs from message file; not sent')
     if list(getattr(written, 'mentions', [])) != chips:
         raise ValueError('Connector chip changed while composing; not sent')
-    current = read_page(page)
-    check_identity(current, identity)
-    if new_user_turn(current, baseline) or current['generating']:
-        raise ValueError('Page changed while composing; not sent')
-    buttons = [ref for ref, meta in current['refs'].items() if meta.get('role') == 'button' and meta.get('name') in ('보내기', 'Send', 'Send message')]
-    if len(buttons) != 1:
-        raise ValueError('No unique send button; not sent')
+    current, selector = wait_send_ready(baseline, identity, message, chips)
+    # Recheck one coherent readiness observation immediately before the receipt.
+    # Browser calls are sequential; this is not an atomic DOM/send transaction.
+    current, selector = wait_send_ready(baseline, identity, message, chips)
     receipt.write_text(json.dumps({'attempted': True, 'status': 'ATTEMPTED', 'page': page,
-                                  'url': current['url'], 'messageSha256': hashlib.sha256(message.encode()).hexdigest()}))
-    orca(page, 'click', '--element', '@' + buttons[0])
-    return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect)
+                                  'url': current['url'], 'messageSha256': hashlib.sha256(message.encode()).hexdigest(),
+                                  'generationProof': generation, 'generationProofSha256': canonical_sha(generation)}))
+    orca(page, 'click', '--element', selector)
+    return confirm_posting(baseline, message, receipt, timeout=posting_timeout, protect=protect, request_proof=request_proof)
 
 
 def main():
@@ -406,6 +923,7 @@ def main():
     wait.add_argument('--task', required=True)
     wait.add_argument('--output', type=Path, required=True)
     wait.add_argument('--message-file', type=Path)
+    wait.add_argument('--receipt', type=Path, help='Receipt with original validated preparation proof may pin its confirmed user identity')
     wait.add_argument('--timeout', type=int, default=600, choices=range(20, 1801))
     send = sub.add_parser('submit')
     send.add_argument('--baseline', type=Path, required=True)
@@ -419,7 +937,10 @@ def main():
     reconcile.add_argument('--message-file', type=Path, required=True)
     reconcile.add_argument('--receipt', type=Path, required=True)
     reconcile.add_argument('--timeout', type=int, default=120, choices=range(0, 601))
+    for parser in (wait, send, reconcile):
+        parser.add_argument('--request-proof', type=Path)
     args = p.parse_args()
+    baseline = None
     try:
         if args.action == 'open':
             result = open_tab(args.url, args.worktree)
@@ -429,9 +950,9 @@ def main():
         if args.action in ('submit', 'reconcile'):
             baseline, message = json.loads(args.baseline.read_text()), args.message_file.read_text()
             if args.action == 'submit':
-                result = submit(baseline, message, args.receipt, args.replace_owned_draft, args.owned_draft_file.read_text() if args.owned_draft_file else None, args.posting_timeout, protect=keep_guarded)
+                result = submit(baseline, message, args.receipt, args.replace_owned_draft, args.owned_draft_file.read_text() if args.owned_draft_file else None, args.posting_timeout, protect=keep_guarded, request_proof=args.request_proof)
             else:
-                result = confirm_posting(baseline, message, args.receipt, timeout=args.timeout, protect=keep_guarded)
+                result = confirm_posting(baseline, message, args.receipt, timeout=args.timeout, protect=keep_guarded, request_proof=args.request_proof)
             print(json.dumps(result)); return 0 if result.get('posted') is True else 2
         if args.action == 'capture':
             keep_guarded(args.page)
@@ -442,8 +963,16 @@ def main():
         else:
             result = wait_reply(json.loads(args.baseline.read_text()), args.task, args.timeout,
                                 message=args.message_file.read_text() if args.message_file else None,
-                                protect=keep_guarded)
+                                protect=keep_guarded, receipt=args.receipt, request_proof=args.request_proof)
         args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+        if result.get('type') in ('reply_mismatch', 'reply_invalid_state'):
+            print(json.dumps({'ok': False, 'type': result['type'], 'complete': False,
+                              'output': str(args.output), 'page': result['page'], 'url': result['url'],
+                              'expectedIdentity': result['expectedIdentity'],
+                              'observedIdentity': result['observedIdentity'],
+                              **({'observedState': result['observedState']}
+                                 if 'observedState' in result else {})}))
+            return 2
         print(json.dumps({'ok': True, 'output': str(args.output), 'page': result['page'], 'url': result['url'], 'count': result['count']}))
         return 0
     except ProtectedDraft as error:
@@ -452,6 +981,9 @@ def main():
     except (ValueError, RuntimeError, TimeoutError, OSError, KeyError) as error:
         print(json.dumps({'ok': False, 'error': str(error)}))
         return 2
+    finally:
+        if args.action == 'submit' and baseline is not None:
+            keep_guarded(baseline['page'])
 
 
 if __name__ == '__main__':
