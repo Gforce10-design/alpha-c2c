@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Orca delivery receipts and paced reply polling. Only submit may send a message."""
+"""Orca, Chrome DevTools or agent-driven delivery receipts and paced reply polling. Only submit may send a message."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
@@ -154,6 +155,27 @@ OBSERVE_EXPRESSION = """JSON.stringify((()=>{
             json.dumps(STOP_NAMES, ensure_ascii=False), json.dumps(OBSERVATION_SCHEMA))
 AGENT_PAGE_PREFIX = 'agent:'
 AGENT_MIN_GAP_SECONDS = 10
+# Chrome DevTools pages: a user-launched local Chrome; DOM observation replaces the AX snapshot.
+CDP_PAGE_PREFIX = 'cdp:'
+CDP_POINTER = {}
+CDP_FOCUS_EXPRESSION = """(()=>{
+  const boxes=Array.from(document.querySelectorAll('form [role=textbox][contenteditable=true],form textarea'));
+  if(boxes.length!==1) return 'no-composer';
+  const e=boxes[0]; e.focus();
+  if(%s){
+    if(e.value!==undefined) e.select();
+    else {const r=document.createRange(); r.selectNodeContents(e); const s=getSelection(); s.removeAllRanges(); s.addRange(r);}
+  }
+  return 'focused';
+})()"""
+CDP_HIT_EXPRESSION = """JSON.stringify((()=>{
+  const found=document.querySelectorAll(%s); if(found.length!==1) return {ok:false};
+  const e=found[0]; e.scrollIntoView({block:'nearest'});
+  const r=e.getBoundingClientRect(), x=r.left+r.width/2, y=r.top+r.height/2, top=document.elementFromPoint(x,y);
+  if(r.width<=0||r.height<=0||!top||!(top===e||e.contains(top))) return {ok:false};
+  if(e.disabled||e.getAttribute('aria-disabled')==='true') return {ok:false};
+  return {ok:true,x,y};
+})())"""
 
 
 class TransientEmptyPage(RuntimeError):
@@ -178,9 +200,93 @@ class ProtectedDraft(ValueError):
         self.draft = draft
 
 
+def _cdp():
+    spec = importlib.util.spec_from_file_location('c2c_cdp', Path(__file__).with_name('cdp.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _cdp_click(session, x, y):
+    for kind in ('mouseMoved', 'mousePressed', 'mouseReleased'):
+        session.call('Input.dispatchMouseEvent', type=kind, x=x, y=y, button='left' if kind != 'mouseMoved' else 'none',
+                     clickCount=1 if kind != 'mouseMoved' else 0)
+
+
+def _cdp_lines(session, text):
+    """Native insertion with Shift+Enter separators, as on the Orca path."""
+    for index, line in enumerate(text.split('\n')):
+        if index:
+            for kind in ('keyDown', 'keyUp'):
+                session.call('Input.dispatchKeyEvent', type=kind, key='Enter', code='Enter',
+                             windowsVirtualKeyCode=13, nativeVirtualKeyCode=13, modifiers=8)
+        if line:
+            session.call('Input.insertText', text=line)
+
+
+def cdp_browser(page, *args):
+    """The Orca verbs this helper uses, over Chrome DevTools Protocol."""
+    session = _cdp().Session(page[len(CDP_PAGE_PREFIX):])
+    try:
+        verb, rest = args[0], list(args[1:])
+        action = rest.pop(0) if verb == 'mouse' else None
+        options = dict(zip(rest[0::2], rest[1::2]))
+        element = options.get('--element')
+        if element is not None and verb in ('focus', 'fill') and element != '@composer':
+            raise ValueError('Unknown element reference on a CDP page')
+        if verb == 'eval':
+            wrapped = '(()=>{const value=(%s);return JSON.stringify({origin:location.href,value});})()' % options['--expression']
+            out = json.loads(session.evaluate(wrapped))
+            return {'result': out.get('value'), 'origin': out['origin']}
+        if verb == 'mouse':
+            if action == 'move':
+                CDP_POINTER[page] = (float(options['--x']), float(options['--y']))
+                x, y = CDP_POINTER[page]
+                session.call('Input.dispatchMouseEvent', type='mouseMoved', x=x, y=y)
+            elif action in ('down', 'up') and page in CDP_POINTER:
+                x, y = CDP_POINTER[page]
+                session.call('Input.dispatchMouseEvent', type='mousePressed' if action == 'down' else 'mouseReleased',
+                             x=x, y=y, button='left', clickCount=1)
+            else:
+                raise ValueError('Unsupported mouse action on a CDP page')
+            return {}
+        if verb == 'focus':
+            if session.evaluate(CDP_FOCUS_EXPRESSION % 'false') != 'focused':
+                raise ValueError('Composer unavailable for focus; not sent')
+            return {}
+        if verb == 'keypress':
+            if options.get('--key') != 'Shift+Enter':
+                raise ValueError('Only Shift+Enter is supported on a CDP page')
+            _cdp_lines(session, '\n')
+            return {}
+        if verb == 'inserttext':
+            session.call('Input.insertText', text=options['--text'])
+            return {}
+        if verb == 'fill':
+            # Replace only the editor contents; the caller reads the composer back.
+            if session.evaluate(CDP_FOCUS_EXPRESSION % 'true') != 'focused':
+                raise ValueError('Composer unavailable for fill; not sent')
+            _cdp_lines(session, options['--value'])
+            return {}
+        if verb == 'click':
+            hit = json.loads(session.evaluate(CDP_HIT_EXPRESSION % json.dumps(element)))
+            if not hit.get('ok'):
+                raise ValueError('Click target unavailable or obscured; no click dispatched')
+            _cdp_click(session, hit['x'], hit['y'])
+            return {}
+        if verb == 'screenshot':
+            session.call('Page.captureScreenshot')
+            return {}
+        raise ValueError('Unsupported browser operation on a CDP page: ' + verb)
+    finally:
+        session.close()
+
+
 def orca(page, *args):
     if page.startswith(AGENT_PAGE_PREFIX):
         raise ValueError('Agent-driven page; use the agent-* subcommands, never Orca')
+    if page.startswith(CDP_PAGE_PREFIX):
+        return cdp_browser(page, *args)
     run = subprocess.run(['orca', *args, '--page', page, '--json'], capture_output=True, text=True, timeout=45)
     data = json.loads(run.stdout)
     if run.returncode or data.get('ok') is not True:
@@ -202,14 +308,17 @@ def keep_guarded(page):
 
 
 def open_tab(url, worktree, timeout=15, interval=0.1, run=subprocess.run,
-             guard=guard_input, sleep=time.sleep, clock=time.monotonic):
+             guard=guard_input, sleep=time.sleep, clock=time.monotonic, backend='orca'):
     """Create an owned tab and guard it as soon as its composer exists."""
-    created = run(['orca', 'tab', 'create', '--url', url, '--worktree', worktree, '--json'],
-                  capture_output=True, text=True, timeout=45)
-    data = json.loads(created.stdout)
-    if created.returncode or data.get('ok') is not True:
-        raise RuntimeError('Tab creation failed')
-    page = data['result']['browserPageId']
+    if backend == 'cdp':
+        page = CDP_PAGE_PREFIX + _cdp().new_target(url)['id']
+    else:
+        created = run(['orca', 'tab', 'create', '--url', url, '--worktree', worktree, '--json'],
+                      capture_output=True, text=True, timeout=45)
+        data = json.loads(created.stdout)
+        if created.returncode or data.get('ok') is not True:
+            raise RuntimeError('Tab creation failed')
+        page = data['result']['browserPageId']
     deadline = clock() + timeout
     while True:
         try:
@@ -226,6 +335,11 @@ def open_tab(url, worktree, timeout=15, interval=0.1, run=subprocess.run,
 
 
 def read_page(page):
+    if page.startswith(CDP_PAGE_PREFIX):
+        observation = json.loads(orca(page, 'eval', '--expression', OBSERVE_EXPRESSION)['result'])
+        if not isinstance(observation, dict) or observation.get('schema') != OBSERVATION_SCHEMA:
+            raise RuntimeError('Browser snapshot unavailable; retain the same page and request.')
+        return page_from_observation(observation, page)
     result = orca(page, 'snapshot')
     if result.get('browserPageId') != page:
         raise ValueError('Browser page identity mismatch')
@@ -1095,7 +1209,9 @@ def main():
     sub = p.add_subparsers(dest='action', required=True)
     opener = sub.add_parser('open', help='Create an owned tab and block stray keyboard input into it')
     opener.add_argument('--url', required=True)
-    opener.add_argument('--worktree', required=True)
+    opener.add_argument('--worktree', help='Orca browser worktree (Orca backend only)')
+    opener.add_argument('--backend', choices=('orca', 'cdp'), default='orca',
+                        help='cdp: a Chrome you launched with --remote-debugging-port on 127.0.0.1')
     opener.add_argument('--output', type=Path, required=True)
     capture = sub.add_parser('capture')
     capture.add_argument('--page', required=True)
@@ -1151,7 +1267,9 @@ def main():
         return agent_main(args)
     try:
         if args.action == 'open':
-            result = open_tab(args.url, args.worktree)
+            if args.backend == 'orca' and not args.worktree:
+                raise ValueError('--worktree is required for the Orca backend')
+            result = open_tab(args.url, args.worktree, backend=args.backend)
             args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
             print(json.dumps({'ok': not result['unknownDraft'], **result}, ensure_ascii=False))
             return 0 if not result['unknownDraft'] else 2

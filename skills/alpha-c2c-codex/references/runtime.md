@@ -4,6 +4,35 @@ These helpers automate mechanical operations, not permission or review decisions
 Use the installed skill directory below. Invoke literal Python commands; no shell
 assignments or compound commands are needed.
 
+## Chrome DevTools delivery
+
+The Orca helper commands also drive a regular Chrome over the Chrome DevTools
+Protocol. The user starts Chrome themselves with a dedicated profile; Chrome
+does not allow remote debugging on the default profile, and while the port is
+open any local program can control that browser. Never point it at your normal
+profile, and close that Chrome when the task ends.
+
+```sh
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$HOME/.c2c-chrome"
+```
+
+On Linux use `google-chrome`, on Windows `chrome.exe`, with the same flags. The
+user signs in to ChatGPT in that window by hand and completes any verification
+there; the helper never handles logins or challenges. A different port is set
+with `C2C_CDP_ENDPOINT=http://127.0.0.1:<port>`; non-loopback endpoints are refused.
+
+Open the owned tab with `--backend cdp` (no worktree), then use the returned
+`cdp:<target>` page with the same `capture`, `submit`, `reconcile` and `wait`
+commands as in the Orca section:
+
+```sh
+python3 <skill-dir>/scripts/wait_reply.py open --backend cdp --url https://chatgpt.com/ --output <outside-repo>/opened.json
+```
+
+The page is read from the DOM, so the AX/DOM identity cross-check of the Orca
+path is unavailable. Guarded tabs, native insertion, ready-button checks,
+receipts and paced waits are unchanged.
+
 ## Agent-driven delivery
 
 Use this without Orca, with any browser tool that can run JavaScript in a specific
