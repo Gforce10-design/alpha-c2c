@@ -1,0 +1,11 @@
+{
+  "name": "alpha-c2c",
+  "owner": { "name": "Gforce10-design" },
+  "plugins": [
+    {
+      "name": "alpha-c2c",
+      "source": "./skills/alpha-c2c-claude",
+      "description": "Collaborate with ChatGPT web for planning and review while Claude Code implements and tests."
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "alpha-c2c",
+  "description": "Collaborate with ChatGPT web for planning and review while Claude Code implements and tests.",
+  "author": { "name": "Gforce10-design" },
+  "homepage": "https://github.com/Gforce10-design/alpha-c2c",
+  "repository": "https://github.com/Gforce10-design/alpha-c2c",
+  "license": "MIT",
+  "skills": "./"
+}

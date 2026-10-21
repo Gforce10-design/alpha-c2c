@@ -31,26 +31,39 @@ Compatibility depends on the installed transport exposing `status --json`, `sess
 
 ## Install
 
+### Claude Code (plugin, recommended)
+
+Claude Code 2.1.275 or later, in a session:
+
+```text
+/plugin install alpha-c2c --marketplace Gforce10-design/alpha-c2c
+```
+
+Older versions:
+
+```text
+/plugin marketplace add Gforce10-design/alpha-c2c
+/plugin install alpha-c2c@alpha-c2c
+```
+
+The skill is then available as `/alpha-c2c:alpha-c2c-claude`. Update with `/plugin marketplace update alpha-c2c`, or turn on auto-update for this marketplace in `/plugin`.
+
+### Codex (built-in skill installer)
+
+Ask Codex to use `$skill-installer` with repo `Gforce10-design/alpha-c2c` and path `skills/alpha-c2c-codex`. It installs into `$CODEX_HOME/skills`.
+
+### Either client (script)
+
 ```sh
 git clone https://github.com/Gforce10-design/alpha-c2c.git
 cd alpha-c2c
-
-# Codex: ~/.agents/skills/alpha-c2c-codex
-python3 scripts/install.py --client codex
-
-# Claude Code: ~/.claude/skills/alpha-c2c-claude
-python3 scripts/install.py --client claude
+python3 scripts/install.py            # every client detected on this machine
+python3 scripts/install.py --dry-run  # show where it would install
 ```
 
-You can install either or both. Start a new agent session after installation.
+The installer follows each client's own settings: Claude Code uses `$CLAUDE_CONFIG_DIR/skills` when that variable is set, otherwise `~/.claude/skills`; Codex uses `$CODEX_HOME/skills` when set, otherwise `~/.agents/skills`. If the skill is already installed in one of those places, that location is reused, so no second copy appears. Choose explicitly with `--client codex|claude|all` or `--skills-dir <dir>`.
 
-For a custom skill directory:
-
-```sh
-python3 scripts/install.py --client codex --skills-dir /path/to/skills
-```
-
-Installation is idempotent when the destination matches. If an existing copy differs, the installer stops without overwriting it. To update, back up and move your existing skill directory, then install again. Uninstall by removing only the installed `alpha-c2c-codex` or `alpha-c2c-claude` directory; transport and account settings are separate.
+Installation is idempotent. If an existing copy differs, the installer stops; `--update` first moves the old copy to `.alpha-c2c-backups/` next to the skills directory (outside it, so it is never loaded twice), then installs. It refuses to replace a directory that is not this skill or a symlink. After installing it reminds you if the `c2c` / `code-with-chatgpt` transport is missing. Start a new agent session afterwards. Uninstall by removing only the installed `alpha-c2c-codex` or `alpha-c2c-claude` directory (or `/plugin uninstall alpha-c2c`); transport and account settings are separate.
 
 Existing third-party C2C skills are not removed. Invoke the new skill explicitly to avoid ambiguous selection, and disable old duplicates using your client's own settings when appropriate.
 
