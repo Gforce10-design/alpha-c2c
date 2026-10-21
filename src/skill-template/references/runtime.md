@@ -7,8 +7,8 @@ assignments or compound commands are needed.
 ## Chrome DevTools delivery
 
 The Orca helper commands also drive a regular Chrome over the Chrome DevTools
-Protocol. The user starts Chrome themselves with a dedicated profile; Chrome
-does not allow remote debugging on the default profile, and while the port is
+Protocol. The user starts Chrome themselves with a dedicated profile: since
+Chrome 136, `--remote-debugging-port` is ignored for the default profile, and while the port is
 open any local program can control that browser. Never point it at your normal
 profile, and close that Chrome when the task ends.
 

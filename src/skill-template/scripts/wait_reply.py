@@ -226,60 +226,71 @@ def _cdp_lines(session, text):
 
 def cdp_browser(page, *args):
     """The Orca verbs this helper uses, over Chrome DevTools Protocol."""
-    session = _cdp().Session(page[len(CDP_PAGE_PREFIX):])
+    module = _cdp()
     try:
-        verb, rest = args[0], list(args[1:])
-        action = rest.pop(0) if verb == 'mouse' else None
-        options = dict(zip(rest[0::2], rest[1::2]))
-        element = options.get('--element')
-        if element is not None and verb in ('focus', 'fill') and element != '@composer':
-            raise ValueError('Unknown element reference on a CDP page')
-        if verb == 'eval':
-            wrapped = '(()=>{const value=(%s);return JSON.stringify({origin:location.href,value});})()' % options['--expression']
-            out = json.loads(session.evaluate(wrapped))
-            return {'result': out.get('value'), 'origin': out['origin']}
-        if verb == 'mouse':
-            if action == 'move':
-                CDP_POINTER[page] = (float(options['--x']), float(options['--y']))
-                x, y = CDP_POINTER[page]
-                session.call('Input.dispatchMouseEvent', type='mouseMoved', x=x, y=y)
-            elif action in ('down', 'up') and page in CDP_POINTER:
-                x, y = CDP_POINTER[page]
-                session.call('Input.dispatchMouseEvent', type='mousePressed' if action == 'down' else 'mouseReleased',
-                             x=x, y=y, button='left', clickCount=1)
-            else:
-                raise ValueError('Unsupported mouse action on a CDP page')
-            return {}
-        if verb == 'focus':
-            if session.evaluate(CDP_FOCUS_EXPRESSION % 'false') != 'focused':
-                raise ValueError('Composer unavailable for focus; not sent')
-            return {}
-        if verb == 'keypress':
-            if options.get('--key') != 'Shift+Enter':
-                raise ValueError('Only Shift+Enter is supported on a CDP page')
-            _cdp_lines(session, '\n')
-            return {}
-        if verb == 'inserttext':
-            session.call('Input.insertText', text=options['--text'])
-            return {}
-        if verb == 'fill':
-            # Replace only the editor contents; the caller reads the composer back.
-            if session.evaluate(CDP_FOCUS_EXPRESSION % 'true') != 'focused':
-                raise ValueError('Composer unavailable for fill; not sent')
-            _cdp_lines(session, options['--value'])
-            return {}
-        if verb == 'click':
-            hit = json.loads(session.evaluate(CDP_HIT_EXPRESSION % json.dumps(element)))
-            if not hit.get('ok'):
-                raise ValueError('Click target unavailable or obscured; no click dispatched')
-            _cdp_click(session, hit['x'], hit['y'])
-            return {}
-        if verb == 'screenshot':
-            session.call('Page.captureScreenshot')
-            return {}
-        raise ValueError('Unsupported browser operation on a CDP page: ' + verb)
+        session = module.Session(page[len(CDP_PAGE_PREFIX):])
+    except OSError as error:
+        # Socket refusals and timeouts are transient, like an Orca CLI timeout.
+        raise module.CDPError('DevTools transport failed; observe again without sending') from error
+    try:
+        return _cdp_verb(session, page, *args)
+    except OSError as error:
+        raise module.CDPError('DevTools transport failed; observe again without sending') from error
     finally:
         session.close()
+
+
+def _cdp_verb(session, page, *args):
+    verb, rest = args[0], list(args[1:])
+    action = rest.pop(0) if verb == 'mouse' else None
+    options = dict(zip(rest[0::2], rest[1::2]))
+    element = options.get('--element')
+    if element is not None and verb in ('focus', 'fill') and element != '@composer':
+        raise ValueError('Unknown element reference on a CDP page')
+    if verb == 'eval':
+        wrapped = '(()=>{const value=(%s);return JSON.stringify({origin:location.href,value});})()' % options['--expression']
+        out = json.loads(session.evaluate(wrapped))
+        return {'result': out.get('value'), 'origin': out['origin']}
+    if verb == 'mouse':
+        if action == 'move':
+            CDP_POINTER[page] = (float(options['--x']), float(options['--y']))
+            x, y = CDP_POINTER[page]
+            session.call('Input.dispatchMouseEvent', type='mouseMoved', x=x, y=y)
+        elif action in ('down', 'up') and page in CDP_POINTER:
+            x, y = CDP_POINTER[page]
+            session.call('Input.dispatchMouseEvent', type='mousePressed' if action == 'down' else 'mouseReleased',
+                         x=x, y=y, button='left', clickCount=1)
+        else:
+            raise ValueError('Unsupported mouse action on a CDP page')
+        return {}
+    if verb == 'focus':
+        if session.evaluate(CDP_FOCUS_EXPRESSION % 'false') != 'focused':
+            raise ValueError('Composer unavailable for focus; not sent')
+        return {}
+    if verb == 'keypress':
+        if options.get('--key') != 'Shift+Enter':
+            raise ValueError('Only Shift+Enter is supported on a CDP page')
+        _cdp_lines(session, '\n')
+        return {}
+    if verb == 'inserttext':
+        session.call('Input.insertText', text=options['--text'])
+        return {}
+    if verb == 'fill':
+        # Replace only the editor contents; the caller reads the composer back.
+        if session.evaluate(CDP_FOCUS_EXPRESSION % 'true') != 'focused':
+            raise ValueError('Composer unavailable for fill; not sent')
+        _cdp_lines(session, options['--value'])
+        return {}
+    if verb == 'click':
+        hit = json.loads(session.evaluate(CDP_HIT_EXPRESSION % json.dumps(element)))
+        if not hit.get('ok'):
+            raise ValueError('Click target unavailable or obscured; no click dispatched')
+        _cdp_click(session, hit['x'], hit['y'])
+        return {}
+    if verb == 'screenshot':
+        session.call('Page.captureScreenshot')
+        return {}
+    raise ValueError('Unsupported browser operation on a CDP page: ' + verb)
 
 
 def orca(page, *args):
