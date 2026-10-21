@@ -71,6 +71,20 @@ class UpdateTests(unittest.TestCase):
                 installer.install("codex", skills, update=True)
             self.assertEqual((foreign / "SKILL.md").read_text(), "---\nname: someone-else\n---\n")
 
+    def test_local_additions_live_outside_the_skill_and_survive_update(self):
+        for client in ("claude", "codex"):
+            self.assertIn("alpha-c2c/local.md", (ROOT / f"skills/alpha-c2c-{client}/SKILL.md").read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            local = home / ".config/alpha-c2c/local.md"
+            local.parent.mkdir(parents=True)
+            local.write_text("my private workflow\n")
+            skills = home / ".claude/skills"
+            path, _ = installer.install("claude", skills)
+            (path / "SKILL.md").write_text("---\nname: alpha-c2c-claude\n---\nedited\n")
+            installer.install("claude", skills, update=True)
+            self.assertEqual(local.read_text(), "my private workflow\n")
+
     def test_cli_dry_run_reports_targets_without_writing(self):
         with tempfile.TemporaryDirectory() as directory:
             with redirect_stdout(io.StringIO()) as out:
