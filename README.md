@@ -33,7 +33,7 @@ Each skill bundles its own connection, `scripts/bridge.py`: a read-only MCP conn
 python3 <skill-dir>/scripts/bridge.py setup -w <repo> --json
 ```
 
-This starts the bridge and tunnel and prints `connectorName`, `mcpUrl` and a five-minute pairing code. In ChatGPT (developer mode on), create a connector with that name and URL and OAuth authentication; on the sign-in page, type the pairing code. `status --json` is read-only, `doctor --json` checks and restarts what is missing, `unpair` revokes access, `stop` shuts it down. A quick-tunnel address changes when the bridge restarts; `doctor` tells you when the connector URL needs updating. The agent runs these steps for you when you ask it to set up C2C.
+This starts the bridge and tunnel and prints `connectorName`, `mcpUrl` and a five-minute pairing code. In ChatGPT (developer mode on), create a connector with that name and URL and OAuth authentication; on the sign-in page, type the pairing code. `status --json` is read-only, `doctor --json` checks and restarts what is missing, `unpair` revokes access, `stop` shuts it down. A quick-tunnel address changes when the bridge restarts, and ChatGPT cannot edit a connector's URL, so `doctor` tells you when to delete and recreate the connector and pair again. The agent runs these steps for you when you ask it to set up C2C.
 
 The reviewer gets nine read-only tools: workspace info, directory listing, file reading, search, git status, git diff, and the recorded test/execution evidence. `.env`, keys and credentials are always denied, and you can add patterns to a `.c2cignore` file. Tokens, sessions and evidence are stored outside the repository, owner-only, in the platform's app-state directory.
 

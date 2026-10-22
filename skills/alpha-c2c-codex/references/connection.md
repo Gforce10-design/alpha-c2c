@@ -27,7 +27,7 @@ Similar directory names do not establish workspace identity.
 
 1. Read existing `prefs --json` and `session get -w <path> --json` first. Reuse saved choices instead of asking on every reconnect.
 2. `python3 <skill-dir>/scripts/bridge.py setup -w <path> --json` starts the bridge and tunnel and prints `connectorName`, `mcpUrl` and a five-minute `pairingCode`. Use only these structured values; do not invent addresses.
-3. In ChatGPT, developer mode must be enabled for custom connectors (Settings → Apps & Connectors → Advanced). Create a connector named exactly `connectorName` with server URL `mcpUrl` and OAuth authentication. When `connectorAction` is `update`, edit the existing connector's URL instead of adding a second one.
+3. In ChatGPT, open Plugins → Add → Add custom MCP server (developer mode must be enabled for custom connectors). Create a connector named exactly `connectorName` with server URL `mcpUrl` and OAuth authentication, then choose Connect. ChatGPT cannot edit a connector's URL: when `connectorAction` is `update`, delete the old connector with that name (its settings page → Delete app) and create it again with the new `mcpUrl`, so only one exists.
 4. ChatGPT opens the bridge's sign-in page. The user types the pairing code shown on this computer. A code works once; if it expired, run `pair -w <path> --json` for a new one.
 5. Verify with an actual `workspace_info` call in the task conversation.
 
@@ -37,7 +37,8 @@ Translate setup steps into the user's language. Use the normal login, two-factor
 
 - `cloudflared` missing: `doctor --no-fix --json` reports it. Ask the user to install it; do not claim the connection works.
 - Zero authentication or 401: inspect the exact connector's authentication, then pair again. Do not use another account's connection as a substitute.
-- Changed address: a quick-tunnel address changes whenever the bridge or tunnel restarts. `doctor --json` reports `connector-address`; update only that connector's URL after confirming the mismatch.
+- Changed address: a quick-tunnel address changes whenever the bridge or tunnel restarts. `doctor --json` reports `connector-address`; after confirming the mismatch, delete and recreate only that connector with the new URL and pair again. Keep the bridge running between sessions to avoid this.
+- ChatGPT says it could not register the OAuth client: the bridge or tunnel is usually down. Check `status --json` or `doctor --no-fix --json` before changing connector settings.
 - Connector chip but no tools: inspect authentication and tool exposure. Do not immediately delete/recreate the connector.
 - Unknown bridge state: `stop -w <path>`, then `setup` again. Tokens survive restarts; the tunnel address does not.
 - Web tool failure: record the actual failure, change the relevant condition, and retry within the task's existing budget. Waiting alone is not a reason to restart the task.

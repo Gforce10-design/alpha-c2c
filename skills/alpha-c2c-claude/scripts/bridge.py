@@ -1206,7 +1206,7 @@ def doctor(workspace, fix):
         if url:
             _, action = remember_endpoint(workspace, url)
             add('connector-address', action == 'none',
-                'unchanged' if action == 'none' else 'ChatGPT connector must use %s/mcp' % url)
+                'unchanged' if action == 'none' else 'recreate the ChatGPT connector with %s/mcp and pair again' % url)
     return {'report': report, 'repairs': repairs}
 
 
