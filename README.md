@@ -33,7 +33,7 @@ Each skill bundles its own connection, `scripts/bridge.py`: a read-only MCP conn
 python3 <skill-dir>/scripts/bridge.py setup -w <repo> --json
 ```
 
-This starts the bridge and tunnel and prints `connectorName`, `mcpUrl` and a five-minute pairing code. In ChatGPT (developer mode on), create a connector with that name and URL and OAuth authentication; on the sign-in page, type the pairing code. `status --json` is read-only, `doctor --json` checks and restarts what is missing, `unpair` revokes access, `stop` shuts it down. A quick-tunnel address changes when the bridge restarts, and ChatGPT cannot edit a connector's URL, so `doctor` tells you when to delete and recreate the connector and pair again. The agent runs these steps for you when you ask it to set up C2C.
+This starts the bridge and tunnel and prints `connectorName`, `mcpUrl` and a five-minute pairing code. In ChatGPT (developer mode on), open Plugins → Add → Add custom MCP server and create a connector with that name and URL and OAuth authentication; on the sign-in page, type the pairing code. `status --json` is read-only, `doctor --json` checks and restarts what is missing, `unpair` revokes access, `stop` shuts it down. A quick-tunnel address changes when the bridge restarts, and ChatGPT cannot edit a connector's URL, so `doctor` tells you when to delete and recreate the connector and pair again. The agent runs these steps for you when you ask it to set up C2C.
 
 **Fixed address (optional, needs your own domain on Cloudflare).** Run `cloudflared tunnel login` once and pick the domain, then:
 
@@ -41,7 +41,7 @@ This starts the bridge and tunnel and prints `connectorName`, `mcpUrl` and a fiv
 python3 <skill-dir>/scripts/bridge.py setup -w <repo> --zone example.com --json
 ```
 
-The bridge creates a named tunnel for that workspace and a DNS record such as `ac2c-claude-<folder>-<id>.example.com`, so the connector URL survives restarts and you pair only once. Existing DNS records are never overwritten. The zone is remembered for new workspaces; `--hostname` picks an exact name and `--quick-tunnel` switches a workspace back. Removing a named tunnel is left to you (`cloudflared tunnel delete`).
+The bridge creates a named tunnel for that workspace and a DNS record such as `ac2c-claude-<folder>-<id>.example.com`, so the connector URL survives restarts and you pair only once. Existing DNS records are never overwritten. The zone is remembered for new workspaces (`prefs set --named-zone none` forgets it); `--hostname` picks an exact name and `--quick-tunnel` switches a workspace back. Removing a named tunnel is left to you: `cloudflared tunnel delete <name>` removes the tunnel, but not its DNS record, so delete the `ac2c-…` record in the Cloudflare dashboard as well.
 
 The reviewer gets nine read-only tools: workspace info, directory listing, file reading, search, git status, git diff, and the recorded test/execution evidence. `.env`, keys and credentials are always denied, and you can add patterns to a `.c2cignore` file. Tokens, sessions and evidence are stored outside the repository, owner-only, in the platform's app-state directory.
 
@@ -82,6 +82,8 @@ The installer follows each client's own settings: Claude Code uses `$CLAUDE_CONF
 Installation is idempotent. If an existing copy differs, the installer stops; `--update` first moves the old copy to `.alpha-c2c-backups/` next to the skills directory (outside it, so it is never loaded twice), then installs. It refuses to replace a directory that is not this skill or a symlink. After installing it reminds you if `cloudflared` is missing. Start a new agent session afterwards. Uninstall by removing only the installed `alpha-c2c-codex` or `alpha-c2c-claude` directory (or `/plugin uninstall alpha-c2c`); bridge state and ChatGPT connectors are separate (`bridge.py unpair` first if you want access revoked).
 
 Machine-specific additions (private workflows, local paths, notes) belong in `~/.config/alpha-c2c/local.md` (or `$XDG_CONFIG_HOME/alpha-c2c/local.md`, or any file named by `$ALPHA_C2C_LOCAL`), not in the installed `SKILL.md`. The skill reads that file at start, and installs or updates never touch it.
+
+Upgrading from a release before 1.0.0, which used the separate codex-with-chatgpt bridge: connectors named `Code with ChatGPT · …` are not used any more. Create the new `Alpha C2C … · <workspace>` connector the first time you set up each workspace, then delete the old one.
 
 Existing third-party C2C skills are not removed. Invoke the new skill explicitly to avoid ambiguous selection, and disable old duplicates using your client's own settings when appropriate.
 
@@ -129,7 +131,11 @@ Both distributable skills are generated from one maintained source in `src/skill
 python3 scripts/build.py
 python3 scripts/build.py --check
 python3 -m unittest discover -s tests -v
+(cd skills/alpha-c2c-claude && python3 -m unittest discover -s tests)
+(cd skills/alpha-c2c-codex && python3 -m unittest discover -s tests)
 ```
+
+Run the skill tests from the generated copies; the template still contains build placeholders.
 
 Tests cover both executors, the bridge's OAuth pairing and MCP tools over real local HTTP, workspace and secret boundaries, non-English messages, malformed checkpoints, repeat prevention recommendations, argument boundaries, multilingual prompts, and non-destructive installation. They do not establish a live ChatGPT login, browser exchange, or end-to-end review. Validate those separately in your own task-owned conversation.
 
