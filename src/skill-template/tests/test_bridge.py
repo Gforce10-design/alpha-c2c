@@ -433,9 +433,14 @@ class NamedTunnelTests(Fixture):
             dead.start()
 
     def test_setup_choice_follows_flags_and_the_default_zone(self):
-        self.fake_cloudflared()
+        _, _, cert = self.fake_cloudflared()
         args = lambda **k: argparse.Namespace(**dict({'zone': None, 'hostname': None, 'quick_tunnel': False}, **k))
         self.assertFalse(b.choose_tunnel(self.w, args()))
+        cert.rename(cert.with_suffix('.away'))
+        with self.assertRaisesRegex(RuntimeError, 'cloudflared tunnel login'):
+            b.choose_tunnel(self.w, args(zone='example.com'))
+        self.assertIsNone((b.read_json(b.state_path('prefs.json'), {}) or {}).get('namedZone'))  # a failed try is not remembered
+        cert.with_suffix('.away').rename(cert)
         self.assertTrue(b.choose_tunnel(self.w, args(zone='example.com')))
         self.assertFalse(b.choose_tunnel(self.w, args(zone='example.com')))
         self.assertTrue(b.choose_tunnel(self.w, args(quick_tunnel=True)))
@@ -443,6 +448,11 @@ class NamedTunnelTests(Fixture):
         other = ws.Workspace(self.root / 'src')
         self.assertTrue(b.choose_tunnel(other, args()))  # a new workspace picks up the remembered zone
         self.assertEqual(b.read_json(b.tunnel_config_path(other.id))['hostname'], b.suggested_hostname(other, 'example.com'))
+        third = ws.Workspace(self.root / 'node_modules')
+        cert.unlink()
+        with patch('sys.stderr'):
+            self.assertFalse(b.choose_tunnel(third, args()))  # a remembered zone that fails falls back to quick
+        self.assertIsInstance(b.make_tunnel(1, third.id), b.QuickTunnel)
 
 
 class CliTests(Fixture):

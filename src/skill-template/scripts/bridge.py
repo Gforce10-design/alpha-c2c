@@ -739,6 +739,7 @@ class NamedTunnel(QuickTunnel):
                 raise RuntimeError('ALPHA_C2C_TUNNEL_PROTOCOL must be auto, quic or http2.')
             argv += ['--protocol', protocol]
         log = open(state_path('logs', 'tunnel-%s.log' % self.workspace_id), 'ab')
+        os.chmod(log.name, 0o600)
         try:
             self.process = subprocess.Popen(argv + ['run', self.config['tunnel']], stdout=log, stderr=log,
                                             stdin=subprocess.DEVNULL)
@@ -1374,20 +1375,27 @@ def choose_tunnel(workspace, args):
             return False
         write_json(path, {'mode': 'quick', 'configuredAt': iso()})
         return True
-    zone = args.zone
-    if args.zone:
-        prefs_path = state_path('prefs.json')
-        prefs = read_json(prefs_path, {}) or {}
-        prefs['namedZone'] = normalize_host(args.zone)
-        write_json(prefs_path, prefs)
-    elif not args.hostname and not current:
-        zone = (read_json(state_path('prefs.json'), {}) or {}).get('namedZone')
+    prefs_path = state_path('prefs.json')
+    zone, remembered = args.zone, False
+    if not args.zone and not args.hostname and not current:
+        zone = (read_json(prefs_path, {}) or {}).get('namedZone')
+        remembered = bool(zone)
     if not args.hostname and not zone:
         return False
     hostname = normalize_host(args.hostname) if args.hostname else suggested_hostname(workspace, zone)
     if current.get('mode') == 'named' and current.get('hostname') == hostname:
         return False
-    provision_named(workspace, hostname)
+    try:
+        provision_named(workspace, hostname)
+    except RuntimeError as error:
+        if not remembered:
+            raise
+        print('warning: fixed address unavailable (%s); using a temporary address.' % error, file=sys.stderr)
+        return False
+    if args.zone:  # remembered only once it worked, so a failed first try never sticks
+        prefs = read_json(prefs_path, {}) or {}
+        prefs['namedZone'] = normalize_host(args.zone)
+        write_json(prefs_path, prefs)
     return True
 
 
