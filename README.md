@@ -17,13 +17,13 @@ Two standalone skills for collaborating with ChatGPT web from **Codex** or **Cla
 - Summarizes bridge status without forwarding raw locale-specific messages or authentication data.
 - Loads connection, browser, and resume details only when needed.
 
-Each skill bundles its own connection, `scripts/bridge.py`: a read-only MCP connector for one workspace, with OAuth pairing and a Cloudflare quick tunnel, written with the Python standard library only. No other C2C tool is needed. The bridge never writes to the workspace or runs commands for the reviewer, and the skill does not modify account settings or migrate active conversations.
+Each skill bundles its own connection, `scripts/bridge.py`: a read-only MCP connector for one workspace, with OAuth pairing and a Cloudflare tunnel, written with the Python standard library only. No other C2C tool is needed. The bridge never writes to the workspace or runs commands for the reviewer, and the skill does not modify account settings or migrate active conversations.
 
 ## Requirements
 
 - Python 3.10+ and `git`; no Python packages.
 - Codex or Claude Code with user-skill support.
-- [`cloudflared`](https://github.com/cloudflare/cloudflared) (for example `brew install cloudflared`). ChatGPT only connects to public HTTPS addresses; the bridge uses a free quick tunnel, so no Cloudflare account is needed.
+- [`cloudflared`](https://github.com/cloudflare/cloudflared) (for example `brew install cloudflared`). ChatGPT only connects to public HTTPS addresses; the bridge uses a free quick tunnel, so no Cloudflare account is needed. A fixed address needs a Cloudflare account with your own domain (see below).
 - A ChatGPT plan that allows custom connectors (developer mode). You are responsible for using ChatGPT within OpenAI's terms; this project only automates your own browser session.
 - A browser integration for automatic message delivery. With Orca the helper drives the tab itself. With a regular Chrome started with remote debugging on 127.0.0.1, the same helper drives it over the Chrome DevTools Protocol (standard library only). With any other browser tool that can run page JavaScript and click (for example Claude in Chrome or a Playwright MCP server), the agent drives the tab and the helper judges its saved DOM observations (agent-driven mode). Without one, delivery is manual.
 
@@ -34,6 +34,14 @@ python3 <skill-dir>/scripts/bridge.py setup -w <repo> --json
 ```
 
 This starts the bridge and tunnel and prints `connectorName`, `mcpUrl` and a five-minute pairing code. In ChatGPT (developer mode on), create a connector with that name and URL and OAuth authentication; on the sign-in page, type the pairing code. `status --json` is read-only, `doctor --json` checks and restarts what is missing, `unpair` revokes access, `stop` shuts it down. A quick-tunnel address changes when the bridge restarts, and ChatGPT cannot edit a connector's URL, so `doctor` tells you when to delete and recreate the connector and pair again. The agent runs these steps for you when you ask it to set up C2C.
+
+**Fixed address (optional, needs your own domain on Cloudflare).** Run `cloudflared tunnel login` once and pick the domain, then:
+
+```sh
+python3 <skill-dir>/scripts/bridge.py setup -w <repo> --zone example.com --json
+```
+
+The bridge creates a named tunnel for that workspace and a DNS record such as `ac2c-claude-<folder>-<id>.example.com`, so the connector URL survives restarts and you pair only once. Existing DNS records are never overwritten. The zone is remembered for new workspaces; `--hostname` picks an exact name and `--quick-tunnel` switches a workspace back. Removing a named tunnel is left to you (`cloudflared tunnel delete`).
 
 The reviewer gets nine read-only tools: workspace info, directory listing, file reading, search, git status, git diff, and the recorded test/execution evidence. `.env`, keys and credentials are always denied, and you can add patterns to a `.c2cignore` file. Tokens, sessions and evidence are stored outside the repository, owner-only, in the platform's app-state directory.
 

@@ -7,7 +7,7 @@ description: Collaborate with ChatGPT web for planning and review while Claude C
 
 ChatGPT web plans and reviews. The current coding agent implements and tests.
 This skill owns the collaboration workflow; do not load another C2C skill on top.
-The bundled `scripts/bridge.py` (Python standard library only) is the connection: a read-only MCP connector reached through a Cloudflare quick tunnel. Run it as `python3 <skill-dir>/scripts/bridge.py <command>`.
+The bundled `scripts/bridge.py` (Python standard library only) is the connection: a read-only MCP connector reached through a Cloudflare tunnel (temporary by default; a fixed address on the user's own domain with `setup --zone`). Run it as `python3 <skill-dir>/scripts/bridge.py <command>`.
 
 ## Language
 

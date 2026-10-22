@@ -2,7 +2,7 @@
 
 The bridge is `python3 <skill-dir>/scripts/bridge.py`. It needs Python 3.10+, `git`, and
 [`cloudflared`](https://github.com/cloudflare/cloudflared)
-for the public HTTPS address ChatGPT connects to (a quick tunnel; no Cloudflare account).
+for the public HTTPS address ChatGPT connects to (a quick tunnel by default, no Cloudflare account; or a named tunnel on the user's own domain, see Fixed address).
 It serves read-only tools for one workspace and never writes files or runs commands for the reviewer.
 State lives outside the workspace (`~/Library/Application Support/alpha-c2c/<executor>` on macOS,
 `%LOCALAPPDATA%\alpha-c2c\<executor>` on Windows, `${XDG_STATE_HOME:-~/.local/state}/alpha-c2c/<executor>` elsewhere;
@@ -32,6 +32,16 @@ Similar directory names do not establish workspace identity.
 5. Verify with an actual `workspace_info` call in the task conversation.
 
 Translate setup steps into the user's language. Use the normal login, two-factor, and consent process. A dismissed dialog alone does not prove authorization.
+
+## Fixed address
+
+A quick-tunnel address changes on every bridge restart, and each change means recreating the connector and pairing again. A user with a domain on Cloudflare can avoid that:
+
+1. The user runs `cloudflared tunnel login` once (a browser login where they choose the domain). Never run it for them or bypass it.
+2. `setup -w <path> --zone <domain> --json` creates this workspace's named tunnel and a DNS record `ac2c-<executor>-<folder>-<id>.<domain>`, and reports `tunnel.mode: named`. `--hostname` sets an exact name instead. Ask before creating DNS records in the user's domain; the bridge never overwrites an existing record.
+3. The zone is remembered (`prefs --json` → `namedZone`), so later workspaces get a fixed address automatically. `setup --quick-tunnel` switches one workspace back; `prefs set --named-zone none` forgets the default.
+
+Switching an existing workspace to a fixed address changes its URL once, so recreate that connector one last time.
 
 ## Recovery
 

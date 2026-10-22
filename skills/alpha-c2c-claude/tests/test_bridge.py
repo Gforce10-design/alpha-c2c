@@ -359,6 +359,92 @@ class TunnelTests(unittest.TestCase):
             b.QuickTunnel(1, 'ws').start()
 
 
+class NamedTunnelTests(Fixture):
+    def fake_cloudflared(self, listed='[]', route_exit=0, route_message=''):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(['rm', '-rf', str(directory)]))
+        calls = directory / 'calls'
+        fake = directory / 'cloudflared'
+        fake.write_text('#!/bin/sh\necho "$@" >> %s\n'
+                        'case "$2" in\n'
+                        '  list) echo \'%s\' ;;\n'
+                        '  create) echo "Created tunnel $3 with id 1234" ;;\n'
+                        '  route) echo "%s" >&2; exit %d ;;\n'
+                        '  *) sleep 30 ;;\n'
+                        'esac\n' % (calls, listed, route_message, route_exit))
+        fake.chmod(0o755)
+        cert = directory / 'cert.pem'
+        cert.write_text('cert')
+        env = patch.dict(os.environ, {'ALPHA_C2C_CLOUDFLARED': str(fake), 'TUNNEL_ORIGIN_CERT': str(cert)})
+        env.start()
+        self.addCleanup(env.stop)
+        return fake, calls, cert
+
+    def test_hostnames_are_validated_and_suggested_per_workspace(self):
+        self.assertEqual(b.normalize_host('https://Example.COM/'), 'example.com')
+        for bad in ('localhost', 'bad_host.example.com', '-a.example.com', ''):
+            with self.assertRaises(RuntimeError):
+                b.normalize_host(bad)
+        host = b.suggested_hostname(self.w, 'Example.com')
+        self.assertEqual(host, 'ac2c-%s-project-%s.example.com' % (b.EXECUTOR, self.w.id[:8]))
+        other = ws.Workspace(self.root / 'src')
+        self.assertNotEqual(b.suggested_hostname(other, 'example.com').split('.')[0], host.split('.')[0])
+
+    def test_provision_creates_once_routes_and_remembers(self):
+        _, calls, _ = self.fake_cloudflared()
+        config = b.provision_named(self.w, 'c2c.example.com')
+        name = 'alpha-c2c-%s-%s' % (b.EXECUTOR, self.w.id)
+        self.assertEqual((config['mode'], config['tunnel'], config['hostname']), ('named', name, 'c2c.example.com'))
+        lines = calls.read_text().splitlines()
+        self.assertEqual(lines, ['tunnel list --output json --name ' + name, 'tunnel create ' + name,
+                                 'tunnel route dns %s c2c.example.com' % name])
+        self.assertIsInstance(b.make_tunnel(1, self.w.id), b.NamedTunnel)
+
+    def test_existing_tunnel_and_route_are_reused_but_other_route_errors_fail(self):
+        name = 'alpha-c2c-%s-%s' % (b.EXECUTOR, self.w.id)
+        _, calls, _ = self.fake_cloudflared(listed='[{"name": "%s"}]' % name, route_exit=1,
+                                            route_message='record with that host already exists')
+        b.provision_named(self.w, 'c2c.example.com')
+        self.assertNotIn('create', calls.read_text())
+        self.fake_cloudflared(route_exit=1, route_message='Authentication error')
+        with self.assertRaisesRegex(RuntimeError, 'could not route'):
+            b.provision_named(self.w, 'other.example.com')
+
+    def test_missing_login_is_explained(self):
+        _, _, cert = self.fake_cloudflared()
+        cert.unlink()
+        with self.assertRaisesRegex(RuntimeError, 'cloudflared tunnel login'):
+            b.provision_named(self.w, 'c2c.example.com')
+        self.assertIsInstance(b.make_tunnel(1, self.w.id), b.QuickTunnel)
+
+    def test_named_tunnel_runs_by_name_and_waits_for_its_hostname(self):
+        fake, calls, _ = self.fake_cloudflared()
+        seen = []
+        config = {'mode': 'named', 'tunnel': 'alpha-c2c-x', 'hostname': 'c2c.example.com'}
+        tunnel = b.NamedTunnel(4321, self.w.id, config, health=lambda url, wid: seen.append(url) or len(seen) > 1)
+        try:
+            self.assertEqual(tunnel.start(), 'https://c2c.example.com')
+            self.assertTrue(tunnel.running())
+        finally:
+            tunnel.stop()
+        self.assertEqual(calls.read_text().strip(), 'tunnel --no-autoupdate --url http://127.0.0.1:4321 run alpha-c2c-x')
+        dead = b.NamedTunnel(1, self.w.id, config, binary='/usr/bin/true', health=lambda url, wid: False, timeout=5)
+        with self.assertRaisesRegex(RuntimeError, 'never answered'):
+            dead.start()
+
+    def test_setup_choice_follows_flags_and_the_default_zone(self):
+        self.fake_cloudflared()
+        args = lambda **k: argparse.Namespace(**dict({'zone': None, 'hostname': None, 'quick_tunnel': False}, **k))
+        self.assertFalse(b.choose_tunnel(self.w, args()))
+        self.assertTrue(b.choose_tunnel(self.w, args(zone='example.com')))
+        self.assertFalse(b.choose_tunnel(self.w, args(zone='example.com')))
+        self.assertTrue(b.choose_tunnel(self.w, args(quick_tunnel=True)))
+        self.assertFalse(b.choose_tunnel(self.w, args()))  # an explicit quick choice is kept
+        other = ws.Workspace(self.root / 'src')
+        self.assertTrue(b.choose_tunnel(other, args()))  # a new workspace picks up the remembered zone
+        self.assertEqual(b.read_json(b.tunnel_config_path(other.id))['hostname'], b.suggested_hostname(other, 'example.com'))
+
+
 class CliTests(Fixture):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, str(ROOT / 'scripts' / 'bridge.py'), *args, '-w', str(self.root)],
