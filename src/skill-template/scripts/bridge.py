@@ -799,8 +799,8 @@ def provision_named(workspace, hostname, binary=None):
     name = 'alpha-c2c-%s-%s' % (EXECUTOR, workspace.id)
     ok, listed, _ = run('tunnel', 'list', '--output', 'json', '--name', name)
     try:
-        exists = ok and any(t.get('name') == name for t in json.loads(listed or '[]'))
-    except (ValueError, AttributeError):
+        exists = ok and any(t.get('name') == name for t in json.loads(listed or 'null') or [])
+    except (ValueError, AttributeError, TypeError):
         exists = False
     if not exists:
         ok, _, out = run('tunnel', 'create', name)

@@ -391,7 +391,7 @@ class NamedTunnelTests(Fixture):
         self.assertNotEqual(b.suggested_hostname(other, 'example.com').split('.')[0], host.split('.')[0])
 
     def test_provision_creates_once_routes_and_remembers(self):
-        _, calls, _ = self.fake_cloudflared()
+        _, calls, _ = self.fake_cloudflared(listed='null')  # what cloudflared prints when no tunnel matches
         config = b.provision_named(self.w, 'c2c.example.com')
         name = 'alpha-c2c-%s-%s' % (b.EXECUTOR, self.w.id)
         self.assertEqual((config['mode'], config['tunnel'], config['hostname']), ('named', name, 'c2c.example.com'))
