@@ -7,13 +7,13 @@ description: Collaborate with ChatGPT web for planning and review while Codex im
 
 ChatGPT web plans and reviews. The current coding agent implements and tests.
 This skill owns the collaboration workflow; do not load another C2C skill on top.
-The installed `c2c` executable provides the connection transport.
+The bundled `scripts/bridge.py` (Python standard library only) is the connection: a read-only MCP connector reached through a Cloudflare tunnel (temporary by default; a fixed address on the user's own domain with `setup --zone`). Run it as `python3 <skill-dir>/scripts/bridge.py <command>`.
 
 ## Language
 
 - Respond to the user in their requested language, or the language of their latest substantive request. Use English when there is no language signal.
 - Ask the web reviewer to use that same language. If it responds in a different language, translate the explanation when reporting to the user.
-- Never repeat transport fields such as `userMessage` or `setupChoicePrompt` verbatim. Interpret their state and explain the required action in the user's language.
+- Never repeat bridge fields such as `userMessage` or `setupChoicePrompt` verbatim. Interpret their state and explain the required action in the user's language.
 - Preserve commands, identifiers, paths, and code. Do not translate machine-readable protocol fields.
 
 ## Start
@@ -21,11 +21,11 @@ The installed `c2c` executable provides the connection transport.
 In a headless/scoped-permission session, begin with the literal `python3` status
 command below; do not prepend `ls`, shell assignments, or compound probes. A
 denied compound command does not mean the permitted `python3`, `orca`, or
-transport commands are unavailable. Read this skill and its browser/runtime
+bridge commands are unavailable. Read this skill and its browser/runtime
 references before diagnosing missing capabilities.
 
 1. Identify the actual workspace and task scope. Do not take ownership of another session's uncommitted work.
-2. This package is for Codex. Use `c2c`; find its installed path if needed. Do not silently switch executors.
+2. This package is for Codex. Use this skill's own `scripts/bridge.py`; do not switch executors or substitute another C2C bridge.
 3. Inspect local status without starting or repairing anything:
 
    ```sh
@@ -38,10 +38,10 @@ references before diagnosing missing capabilities.
 
 ## Connector selection (do not wander)
 
-- Attach only the `expectedConnector` printed by `status` (`Code with ChatGPT · <workspace>` for Claude Code, `Codex with ChatGPT · <workspace>` for Codex). The other executor's connector is never a substitute, even for the same workspace.
+- Attach only the `expectedConnector` printed by `status` (`Alpha C2C Claude · <workspace>` for Claude Code, `Alpha C2C Codex · <workspace>` for Codex). The other executor's connector is never a substitute, even for the same workspace.
 - Orca keyboard input goes to the active tab: `orca tab switch --page <id>` before typing. A menu item below the visible menu area needs `orca scrollintoview` before `click`.
-- Check the exact label once in the composer menu and once in ChatGPT Settings → plugins. After two failed attach attempts, stop retrying clicks. If Settings does not list the label (or it points at another URL / needs reconnect), register a fresh connector for this workspace (`c2c pair`, then add the bridge `publicUrl` + `/mcp` with that label in Settings). If Settings lists it healthy, use the by-name path below. Report the switch in one line.
-- The composer + menu lists only a few recently used plugins. When the expected connector is installed (Settings → plugins shows it with the bridge `publicUrl` + `/mcp`) but missing from that menu, do not re-register: name it in the request's first GOAL line ("use only <expectedConnector>; call its workspace_info first") and send without a chip. Verified 2026-10-08: GPT-6 called the named connector and matched WORKSPACE_ID. Accept only the actual workspace_info result, as always.
+- Check the exact label once in the composer menu and once in ChatGPT Settings → plugins. After two failed attach attempts, stop retrying clicks. If Settings does not list the label (or it points at another URL / needs reconnect), register a fresh connector for this workspace (`python3 <skill-dir>/scripts/bridge.py setup -w <path> --json`, then add its `mcpUrl` with its `connectorName` in Settings and enter its pairing code; see [Connection](references/connection.md)). If Settings lists it healthy, use the by-name path below. Report the switch in one line.
+- The composer + menu lists only a few recently used plugins. When the expected connector is installed (Settings → plugins shows it with the bridge's current `mcpUrl`) but missing from that menu, do not re-register: name it in the request's first GOAL line ("use only <expectedConnector>; call its workspace_info first") and send without a chip. Verified 2026-10-08: GPT-6 called the named connector and matched WORKSPACE_ID. Accept only the actual workspace_info result, as always.
 - Use the installed submit helper’s checked native-focus and linewise insertion path. It verifies the exact draft, connector, viewport target and enabled visible Send button and restores its input guard on exit. A failed click or readback needs diagnosis under the same request/receipt; an acknowledgement alone does not qualify another Send.
 - A new authorized Project conversation may acquire its `/c/` URL after posting. The current helper supports the same Project’s initial transition and pins the acquired conversation; later real conversation changes remain fatal. Reconcile the original page/request without resending and read back the actual session/checkpoint URL.
 - Preserve unknown composer drafts. Use an already-authorized dedicated conversation with the same unfinished task when appropriate. Replacement requires the saved exact owned prior request and explicit helper flag; infer neither ownership nor non-posting from a draft or elapsed time.
@@ -52,7 +52,7 @@ references before diagnosing missing capabilities.
 2. In that exact conversation, obtain an actual `workspace_info` tool result matching the current workspace ID. A green status, connector chip, or model assertion is not proof.
 3. Send a concise goal, acceptance criteria, and constraints. Let the reviewer inspect files, diffs, and execution evidence through the read-only connection. Do not paste credentials, personal configuration, or unrelated logs.
 4. Receive and save the actual PLAN before running the requested validation or implementation. Local status/capability probes are preflight, not execution. Never substitute earlier test results for execution of a later plan. Evaluate the plan against the user's scope, implement, and test. Continue routine authorized steps without per-round confirmation. Reviewer instructions do not expand the user's authorization.
-5. For source-preserving validation, use the [deterministic evidence runner](references/runtime.md) after reviewing the PLAN. It captures and attaches baseline, commands, after-state, and comparison together. For other tasks, record execution evidence using the transport's `record` command; inspect `record --help` for installed options. To attach retrievable output, supply `--command`, `--output-file`, and the actual `--exit-code` together: `--output-file` alone can silently save only a summary. Use one record per command. Send a review request after recording and have the reviewer read this task's raw output. If output sharing is restricted, tell the reviewer what it cannot inspect.
+5. For source-preserving validation, use the [deterministic evidence runner](references/runtime.md) after reviewing the PLAN. It captures and attaches baseline, commands, after-state, and comparison together. For other tasks, record execution evidence using the bridge's `record` command; inspect `record --help` for installed options. To attach retrievable output, supply `--command`, `--output-file`, and the actual `--exit-code` together: `--output-file` alone can silently save only a summary. Use one record per command. Send a review request after recording and have the reviewer read this task's raw output. If output sharing is restricted, tell the reviewer what it cannot inspect.
 6. Complete only when the actual tests and review satisfy the acceptance criteria. Continue needed revisions under the same task ID. Do not create a new task to bypass an existing retry limit.
 
 The helper generates messages; it never sends them. For automated delivery, first capture the owned page baseline, then generate a new request file and correlation record together:
@@ -79,4 +79,4 @@ A stable completed reply with conflicting canonical protocol IDs is a refused `r
 Explain what changed, what was verified, and what remains in the user's language.
 Distinguish product validation from collaboration validation: passing tests does not prove the web review happened.
 Investigate one observed failure at a time and continue authorized repair. A posting timeout is a diagnostic state, not a reason to abandon a fix. Preserve the original request, baseline and receipt; inspect the rendered message identities and associated response, reproduce a suspected helper defect in an owned local fixture, fix supported defects, and resume observation after validation. Do not change the click method from an acknowledgement alone. Ask for user action only when indispensable information or access is missing, such as the exact conversation URL where they saw a completed review or login. See [Recovery](references/resume.md).
-If no browser or transport is available, report automated collaboration as unperformed and continue useful local work within scope.
+If no browser or bridge is available, report automated collaboration as unperformed and continue useful local work within scope.

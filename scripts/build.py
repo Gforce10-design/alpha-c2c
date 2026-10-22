@@ -5,8 +5,8 @@ import argparse
 
 ROOT = Path(__file__).resolve().parents[1]
 VARIANTS = {
-    "codex": {"__SKILL_NAME__": "alpha-c2c-codex", "__EXECUTOR__": "Codex", "__EXECUTOR_ID__": "codex", "__BRIDGE__": "c2c"},
-    "claude": {"__SKILL_NAME__": "alpha-c2c-claude", "__EXECUTOR__": "Claude Code", "__EXECUTOR_ID__": "claude", "__BRIDGE__": "code-with-chatgpt"},
+    "codex": {"__SKILL_NAME__": "alpha-c2c-codex", "__EXECUTOR__": "Codex", "__EXECUTOR_ID__": "codex"},
+    "claude": {"__SKILL_NAME__": "alpha-c2c-claude", "__EXECUTOR__": "Claude Code", "__EXECUTOR_ID__": "claude"},
 }
 
 

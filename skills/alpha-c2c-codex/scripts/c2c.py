@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, read-only transport adapter and language-aware message generator."""
+"""Small, read-only bridge status adapter and language-aware message generator."""
 from __future__ import annotations
 
 import argparse
@@ -38,7 +38,8 @@ def nonnegative_int(value: object) -> bool:
     return type(value) is int and value >= 0
 
 
-CONNECTOR_PREFIX = {"claude": "Code with ChatGPT", "codex": "Codex with ChatGPT"}
+CONNECTOR_PREFIX = {"claude": "Alpha C2C Claude", "codex": "Alpha C2C Codex"}
+BRIDGE = Path(__file__).resolve().with_name("bridge.py")
 
 
 def expected_connector(executor: str, workspace_name: object) -> str | None:
@@ -174,17 +175,22 @@ def prepare_request(kind, task, workspace_id, language, iteration, content, base
     return {'prepared': True, 'output': str(output), 'requestProof': str(proof_path), 'messageSha256': proof['messageSha256']}
 
 
-def query_status(workspace: Path, executable: str, executor: str = "codex") -> dict:
+def query_status(workspace: Path, executable: str | None = None, executor: str = "codex") -> dict:
     workspace = workspace.expanduser().resolve()
     if not workspace.is_dir():
         raise InputError("Workspace directory does not exist.")
-    program = shutil.which(executable)
-    if not program:
-        raise InputError("Transport executable not found. Install it or pass --bridge with its path.")
+    if executable:
+        program = shutil.which(executable)
+        if not program:
+            raise InputError("Transport executable not found. Check the --bridge path.")
+        argv = [program]
+    else:
+        argv = [sys.executable, str(BRIDGE)]
+    env = dict(os.environ, ALPHA_C2C_EXECUTOR=executor)
     try:
         result = subprocess.run(
-            [program, "status", "-w", str(workspace), "--json"],
-            capture_output=True, text=True, encoding="utf-8", timeout=15, check=False,
+            [*argv, "status", "-w", str(workspace), "--json"],
+            capture_output=True, text=True, encoding="utf-8", timeout=15, check=False, env=env,
         )
     except subprocess.TimeoutExpired:
         raise InputError("Status query timed out. No setup or repair was attempted.") from None
@@ -202,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     status = sub.add_parser("status", help="Inspect local bridge status without setup or repair")
     status.add_argument("--workspace", type=Path, required=True)
     status.add_argument("--executor", choices=("codex", "claude"), default="codex")
-    status.add_argument("--bridge", help="Exact executable path; overrides the executor's default CLI")
+    status.add_argument("--bridge", help="Another bridge executable; default is this skill's scripts/bridge.py")
     resume = sub.add_parser("resume", help="Explain the next action from saved session JSON")
     resume.add_argument("--session-file", type=Path, required=True)
     msg = sub.add_parser("message", help="Generate a request; never send it")
@@ -220,8 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
-            default = "c2c" if args.executor == "codex" else "c2c"
-            output = query_status(args.workspace, args.bridge or default, args.executor)
+            output = query_status(args.workspace, args.bridge, args.executor)
         elif args.command == "resume":
             output = resume_summary(json.loads(args.session_file.read_text(encoding="utf-8")))
         else:

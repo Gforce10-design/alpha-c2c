@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install a standalone skill without changing bridge or account settings."""
+"""Install a standalone skill without changing bridge state or account settings."""
 from datetime import datetime, timezone
 from pathlib import Path
 import argparse
@@ -10,7 +10,6 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CLIENTS = ("codex", "claude")
-BRIDGES = {"codex": "c2c", "claude": "code-with-chatgpt"}
 
 
 def files(root):
@@ -127,8 +126,8 @@ def main(argv=None):
         try:
             path, action = install(client, directory, args.update)
             print(f"{action}: {path}")
-            if not shutil.which(BRIDGES[client]):
-                print(f"  note: `{BRIDGES[client]}` transport not found on PATH; install it before collaborating (see README).")
+            if not shutil.which("cloudflared"):
+                print("  note: `cloudflared` not found on PATH; install it before connecting ChatGPT (see README).")
         except (ValueError, OSError) as error:
             print(f"{client}: installation stopped: {error}")
             status = 2
